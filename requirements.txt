@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+websockets
+python-dotenv
+python-multipart
+redis
+langgraph
+langchain
+deepagents
+langchain-litellm
+langchain-tavily
+supabase
+Pillow
+pillow-heif
+psycopg2-binary

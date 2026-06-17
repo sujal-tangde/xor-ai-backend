@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./venv/Scripts/python.exe -c \"from src.main import app; print\\('OK:', app.title\\); print\\([r.path for r in app.routes if hasattr\\(r, 'path'\\)]\\)\")",
+      "Bash(./venv/Scripts/python.exe -c \"import deepagents, inspect; print\\(deepagents.__version__ if hasattr\\(deepagents,'__version__'\\) else 'no ver'\\); print\\([n for n in dir\\(deepagents\\) if not n.startswith\\('_'\\)]\\)\")",
+      "Bash(./venv/Scripts/python.exe -c \"import deepagents, inspect; print\\(inspect.signature\\(deepagents.create_deep_agent\\)\\); print\\('---DOC---'\\); print\\(\\(deepagents.create_deep_agent.__doc__ or ''\\)[:1500]\\)\")",
+      "Bash(./venv/Scripts/python.exe -c ' *)",
+      "Bash(./venv/Scripts/python.exe -m pip install langchain-litellm)",
+      "Bash(./venv/Scripts/python.exe -c \"from langchain_litellm import ChatLiteLLM; print\\('ok'\\)\")",
+      "Bash(timeout 90 ./venv/Scripts/python.exe -c ' *)",
+      "Bash(./venv/Scripts/python.exe -m pip install boto3)"
+    ]
+  }
+}
