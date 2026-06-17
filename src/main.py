@@ -2,15 +2,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.core.config import APP_NAME
-from src.routers import chat, files, health
-from src.services.file_storage import ensure_files_table
+from src.core.db import ensure_schema
+from src.routers import auth, chat, files, health, projects
 
 app = FastAPI(title=APP_NAME)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
-    ensure_files_table()
+    ensure_schema()
 
 # Allow the frontend to connect (tighten allow_origins for production).
 app.add_middleware(
@@ -23,4 +23,6 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(chat.router)
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(projects.router, prefix="/api", tags=["projects"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])

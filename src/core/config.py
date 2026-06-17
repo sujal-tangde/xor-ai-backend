@@ -33,6 +33,12 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 # Supabase (storage + Postgres metadata for uploads).
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip().strip('"').strip("'")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip().strip('"').strip("'")
 DIRECT_URL = os.getenv("DIRECT_URL", "").strip().strip('"').strip("'")
 STORAGE_BUCKET_COMPRESSED = os.getenv("STORAGE_BUCKET_1", "compressed_uploads").strip().strip('"').strip("'")
 STORAGE_BUCKET_ORIGINAL = os.getenv("STORAGE_BUCKET_2", "original_uploads").strip().strip('"').strip("'")
+
+# Supabase Auth (email/password + OAuth). Redirect lands on the frontend callback.
+AUTH_REDIRECT_URL = os.getenv(
+    "AUTH_REDIRECT_URL", "http://localhost:5173/auth/callback"
+).strip().strip('"').strip("'")

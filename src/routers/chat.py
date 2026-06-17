@@ -1,36 +1,77 @@
-"""WebSocket endpoint for real-time chat with the AI agent."""
+"""WebSocket endpoint for real-time chat with the AI agent (auth-protected)."""
 
 import asyncio
+from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from src.agent.chat_agent import chat_stream
-from src.services.chat_history import append_messages, get_messages
+from src.core.auth import user_from_token
+from src.services import projects_service as ps
+from src.services.chat_history import (
+    append_messages,
+    count_messages,
+    get_messages,
+    seed_messages,
+)
 
 router = APIRouter(tags=["chat"])
 
 
+async def _hydrate_if_needed(conversation_id: str) -> None:
+    """Populate Redis from the DB the first time a conversation is opened."""
+    if await count_messages(conversation_id) > 0:
+        return
+    db_messages = await asyncio.to_thread(ps.get_conversation_messages, conversation_id)
+    await seed_messages(conversation_id, db_messages)
+
+
+def _persist(conversation_id: str, user_id: str, messages: list[dict], title: str | None) -> None:
+    """Fire-and-forget DB write so the user never waits on persistence."""
+
+    async def _run() -> None:
+        try:
+            await asyncio.to_thread(ps.save_messages, conversation_id, user_id, messages)
+            if title is not None:
+                await asyncio.to_thread(
+                    ps.update_conversation_title, user_id, conversation_id, title
+                )
+            else:
+                await asyncio.to_thread(ps.touch_conversation, user_id, conversation_id)
+        except Exception:
+            # Persistence is best-effort; Redis already holds the live history.
+            pass
+
+    asyncio.create_task(_run())
+
+
 @router.websocket("/ws/chat")
 async def chat_socket(websocket: WebSocket):
-    """Real-time chat with Redis-backed history per chat_id.
+    """Real-time chat with Redis-backed history per conversation.
 
-    Client -> server:
-      {"chat_id": "...", "type": "load_history"}
-      {"chat_id": "...", "message": "...", "file_ids": ["uuid", ...]}
-
-    Server -> client:
-      {"type": "history", "chat_id": "...", "messages": [...]}
-      {"type": "stream_start", "chat_id": "..."}
-      {"type": "tool_start", "chat_id": "...", "tool": "...", "label": "..."}
-      {"type": "tool_query", "chat_id": "...", "tool": "...", "query": "..."}
-      {"type": "tool_end", "chat_id": "...", "tool": "...", "label": "..."}
-      {"type": "tools_used", "chat_id": "...", "tools": [...]}
-      {"type": "stream_delta", "chat_id": "...", "delta": "..."}
-      {"type": "stream_reset", "chat_id": "..."}
-      {"type": "stream_end", "chat_id": "...", "content": "...", "tools_used": [...]}
-      {"role": "error", "content": "..."}
+    The socket authenticates via a ``token`` query param (Supabase access token).
+    The ``chat_id`` field on each message is the conversation UUID and must belong
+    to the authenticated user.
     """
+    user = user_from_token(websocket.query_params.get("token"))
+    if user is None:
+        await websocket.close(code=4401)
+        return
+
+    user_id = user["id"]
     await websocket.accept()
+
+    # Per-connection cache of conversations already verified as owned by this user.
+    verified: dict[str, dict[str, Any]] = {}
+
+    async def _resolve(conversation_id: str) -> dict[str, Any] | None:
+        if conversation_id in verified:
+            return verified[conversation_id]
+        conv = await asyncio.to_thread(ps.get_conversation, user_id, conversation_id)
+        if conv is not None:
+            verified[conversation_id] = conv
+        return conv
+
     try:
         while True:
             data = await websocket.receive_json()
@@ -49,7 +90,15 @@ async def chat_socket(websocket: WebSocket):
 
             chat_id = str(chat_id)
 
+            conv = await _resolve(chat_id)
+            if conv is None:
+                await websocket.send_json(
+                    {"role": "error", "content": "Conversation not found."}
+                )
+                continue
+
             if data.get("type") == "load_history":
+                await _hydrate_if_needed(chat_id)
                 history = await get_messages(chat_id)
                 await websocket.send_json(
                     {
@@ -78,7 +127,9 @@ async def chat_socket(websocket: WebSocket):
                 file_ids = [str(file_id) for file_id in raw_file_ids if file_id]
 
             try:
+                await _hydrate_if_needed(chat_id)
                 history = await get_messages(chat_id)
+                was_empty = len(history) == 0
                 user_message: dict = {"role": "user", "content": str(message)}
                 if file_ids:
                     user_message["file_ids"] = file_ids
@@ -133,7 +184,12 @@ async def chat_socket(websocket: WebSocket):
                 assistant_message: dict = {"role": "assistant", "content": reply}
                 if tools_used:
                     assistant_message["tools_used"] = tools_used
+
+                # Live cache (awaited, fast) then durable DB write (fire-and-forget).
                 await append_messages(chat_id, user_message, assistant_message)
+                new_title = str(message)[:60] if was_empty else None
+                _persist(chat_id, user_id, [user_message, assistant_message], new_title)
+
                 await websocket.send_json(
                     {
                         "type": "stream_end",

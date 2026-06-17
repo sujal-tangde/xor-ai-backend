@@ -141,7 +141,13 @@ def _upload_bytes(bucket: str, path: str, data: bytes, content_type: str) -> str
     return _public_url(bucket, path)
 
 
-async def upload_file(filename: str, data: bytes, content_type: str | None) -> dict[str, Any]:
+async def upload_file(
+    filename: str,
+    data: bytes,
+    content_type: str | None,
+    user_id: str,
+    project_id: str,
+) -> dict[str, Any]:
     ext = _ext(filename)
     if ext not in ALLOWED_EXTS:
         raise ValueError(
@@ -177,6 +183,8 @@ async def upload_file(filename: str, data: bytes, content_type: str | None) -> d
         "mime_type": mime,
         "size_bytes": len(data),
         "image_analysis_status": "processing" if is_image else None,
+        "user_id": user_id,
+        "project_id": project_id,
     }
 
     client = get_supabase()
@@ -191,14 +199,17 @@ async def upload_file(filename: str, data: bytes, content_type: str | None) -> d
     return record
 
 
-async def list_files() -> list[dict[str, Any]]:
+async def list_files(user_id: str, project_id: str) -> list[dict[str, Any]]:
+    """List files for a project. Files are shared across all chats in the project."""
     client = get_supabase()
     result = (
         client.table("uploaded_files")
         .select(
             "id, name, original_url, compressed_url, file_type, mime_type, "
-            "size_bytes, image_analysis, image_analysis_status, created_at"
+            "size_bytes, image_analysis, image_analysis_status, created_at, project_id"
         )
+        .eq("user_id", user_id)
+        .eq("project_id", project_id)
         .order("created_at", desc=True)
         .execute()
     )
@@ -228,9 +239,15 @@ def _storage_path_from_url(url: str, bucket: str) -> str | None:
     return url[idx + len(marker) :]
 
 
-async def delete_file(file_id: str) -> bool:
+async def delete_file(file_id: str, user_id: str) -> bool:
     client = get_supabase()
-    result = client.table("uploaded_files").select("*").eq("id", file_id).execute()
+    result = (
+        client.table("uploaded_files")
+        .select("*")
+        .eq("id", file_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
     if not result.data:
         return False
 
@@ -247,5 +264,7 @@ async def delete_file(file_id: str) -> bool:
         if compressed_path:
             client.storage.from_(STORAGE_BUCKET_COMPRESSED).remove([compressed_path])
 
-    client.table("uploaded_files").delete().eq("id", file_id).execute()
+    client.table("uploaded_files").delete().eq("id", file_id).eq(
+        "user_id", user_id
+    ).execute()
     return True

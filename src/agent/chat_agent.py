@@ -9,17 +9,14 @@ from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_litellm import ChatLiteLLM
-from langchain_tavily import TavilySearch
 from deepagents import create_deep_agent
 
-from src.agent.tools.image_analysis_tool import get_image_analysis
+from src.agent.tools import get_agent_tools, tool_label
 from src.core.config import (
     AWS_REGION,
     LLM_API_BASE,
     LLM_API_KEY,
     LLM_MODEL,
-    LLM_TOOLS_ENABLED,
-    TAVILY_API_KEY,
 )
 
 StreamEventType = Literal["delta", "reset", "tool_start", "tool_end", "tool_query", "tools_used"]
@@ -62,19 +59,9 @@ def _build_model() -> ChatLiteLLM:
 def get_agent():
     """Create (once) and return the compiled deep agent."""
     model = _build_model()
-    tools = [get_image_analysis]
-    if LLM_TOOLS_ENABLED and TAVILY_API_KEY:
-        tools.append(
-            TavilySearch(
-                max_results=5,
-                tavily_api_key=TAVILY_API_KEY,
-                include_answer=True,
-                auto_parameters=True,
-            )
-        )
     return create_deep_agent(
         model=model,
-        tools=tools,
+        tools=get_agent_tools(),
         system_prompt=_system_prompt(),
     )
 
@@ -139,14 +126,6 @@ def _try_parse_tool_input(args_str: str) -> str:
     return ""
 
 
-def _tool_label(tool_name: str) -> str:
-    if tool_name == "tavily_search":
-        return "web search"
-    if tool_name == "get_image_analysis":
-        return "image analysis"
-    return tool_name.replace("_", " ")
-
-
 async def chat_stream(
     messages: list[dict[str, Any]],
 ) -> AsyncIterator[dict[str, Any]]:
@@ -184,7 +163,7 @@ async def chat_stream(
                         yield {
                             "type": "tool_start",
                             "tool": tool_name,
-                            "label": _tool_label(tool_name),
+                            "label": tool_label(tool_name),
                         }
 
                     if args_piece:
@@ -217,14 +196,14 @@ async def chat_stream(
             used_tools.append(
                 {
                     "tool": tool_name,
-                    "label": _tool_label(tool_name),
+                    "label": tool_label(tool_name),
                     "query": last_query_by_tool.get(tool_name, ""),
                 }
             )
             yield {
                 "type": "tool_end",
                 "tool": tool_name,
-                "label": _tool_label(tool_name),
+                "label": tool_label(tool_name),
             }
             pending_args.clear()
 

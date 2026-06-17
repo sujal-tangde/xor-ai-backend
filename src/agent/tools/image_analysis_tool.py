@@ -6,6 +6,9 @@ from langchain_core.tools import tool
 
 from src.services.file_storage import get_files_by_ids
 
+TOOL_NAME = "get_image_analysis"
+TOOL_LABEL = "image analysis"
+
 
 def _format_analysis_record(record: dict) -> str:
     name = record.get("name") or "Unknown"
