@@ -36,7 +36,12 @@ def _system_prompt() -> str:
         "your sources, and mention when the data was published if known. "
         "When the user attaches image file IDs, you MUST call get_image_analysis "
         "with those IDs before answering questions about the hardware, PCB, "
-        "components, enclosure, or teardown shown in those images. Combine image "
+        "components, enclosure, or teardown shown in those images. "
+        "When a project ID is provided and the user asks about the overall project, "
+        "the product as a whole, the full component list / bill of materials, the "
+        "system architecture, or anything spanning more than one uploaded image, "
+        "call get_project_context with that project ID to load the accumulated "
+        "analysis of all images uploaded to the project. Combine image "
         "analysis with web search when the user asks for both hardware details and "
         "current external information (e.g. part datasheets, market prices). "
         "If you don't know something after searching, say so instead of guessing."
@@ -75,15 +80,33 @@ def _file_ids_hint(file_ids: list[str]) -> str:
     )
 
 
-def _to_lc_messages(messages: list[dict[str, Any]]) -> list[HumanMessage | AIMessage]:
+def _project_hint(project_id: str) -> str:
+    return (
+        f"\n\n[Project ID: {project_id}. Use get_project_context with this ID to "
+        "load the accumulated analysis of all images uploaded to this project when "
+        "the user asks about the overall project, the full component list, the "
+        "system architecture, or anything spanning multiple images.]"
+    )
+
+
+def _to_lc_messages(
+    messages: list[dict[str, Any]], project_id: str | None = None
+) -> list[HumanMessage | AIMessage]:
     lc_messages: list[HumanMessage | AIMessage] = []
-    for message in messages:
+    last_user_idx = max(
+        (i for i, m in enumerate(messages) if m.get("role") == "user"),
+        default=-1,
+    )
+    for idx, message in enumerate(messages):
         role = message.get("role")
         content = str(message.get("content", ""))
         if role == "user":
             file_ids = message.get("file_ids")
             if file_ids:
                 content += _file_ids_hint([str(file_id) for file_id in file_ids])
+            # Attach the project hint only to the latest user turn.
+            if project_id and idx == last_user_idx:
+                content += _project_hint(project_id)
             lc_messages.append(HumanMessage(content=content))
         elif role == "assistant":
             lc_messages.append(AIMessage(content=content))
@@ -128,6 +151,7 @@ def _try_parse_tool_input(args_str: str) -> str:
 
 async def chat_stream(
     messages: list[dict[str, Any]],
+    project_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream assistant events for a conversation history.
 
@@ -140,7 +164,7 @@ async def chat_stream(
       - ``tools_used``: ``{"type": "tools_used", "tools": [...]}`` — final summary
     """
     agent = get_agent()
-    lc_messages = _to_lc_messages(messages)
+    lc_messages = _to_lc_messages(messages, project_id)
     current_id: str | None = None
     announced_tools: set[str] = set()
     pending_args: dict[str, str] = {}

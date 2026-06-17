@@ -194,7 +194,7 @@ async def upload_file(
     if is_image and compressed_data is not None:
         from src.services.image_analysis import schedule_image_analysis
 
-        schedule_image_analysis(file_id, compressed_data)
+        schedule_image_analysis(file_id, compressed_data, project_id)
 
     return record
 

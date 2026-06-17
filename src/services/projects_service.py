@@ -56,6 +56,22 @@ def get_project(user_id: str, project_id: str) -> dict[str, Any] | None:
     return result.data[0] if result.data else None
 
 
+def get_project_context(project_id: str) -> dict[str, Any] | None:
+    """Fetch a project's accumulated theory + structured context by ID.
+
+    Used by the agent tool, which receives a project_id already scoped to the
+    authenticated user's conversation, so no user filter is applied here.
+    """
+    result = (
+        get_supabase()
+        .table("projects")
+        .select("id, name, context, structured_context")
+        .eq("id", project_id)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
 def update_project(
     user_id: str, project_id: str, fields: dict[str, Any]
 ) -> dict[str, Any] | None:

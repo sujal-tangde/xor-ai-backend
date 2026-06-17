@@ -141,7 +141,8 @@ async def chat_socket(websocket: WebSocket):
 
                 reply_parts: list[str] = []
                 tools_used: list[dict[str, str]] = []
-                async for event in chat_stream(agent_messages):
+                project_id = conv.get("project_id")
+                async for event in chat_stream(agent_messages, project_id):
                     event_type = event.get("type")
                     if event_type == "reset":
                         reply_parts = []

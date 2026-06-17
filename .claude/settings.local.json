@@ -8,7 +8,8 @@
       "Bash(./venv/Scripts/python.exe -m pip install langchain-litellm)",
       "Bash(./venv/Scripts/python.exe -c \"from langchain_litellm import ChatLiteLLM; print\\('ok'\\)\")",
       "Bash(timeout 90 ./venv/Scripts/python.exe -c ' *)",
-      "Bash(./venv/Scripts/python.exe -m pip install boto3)"
+      "Bash(./venv/Scripts/python.exe -m pip install boto3)",
+      "PowerShell(python -m py_compile src/services/image_analysis.py src/services/projects_service.py src/services/file_storage.py src/agent/chat_agent.py src/agent/tools/__init__.py src/agent/tools/project_context_tool.py src/routers/chat.py; if \\($?\\) { \"OK\" })"
     ]
   }
 }
