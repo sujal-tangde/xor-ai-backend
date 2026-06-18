@@ -73,9 +73,9 @@ def _headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {_get_token()}",
         "X-DIGIKEY-Client-Id": DIGIKEY_CLIENT_ID,
-        "X-DIGIKEY-Locale-Site": DIGIKEY_LOCALE_SITE,
-        "X-DIGIKEY-Locale-Language": DIGIKEY_LOCALE_LANGUAGE,
-        "X-DIGIKEY-Locale-Currency": DIGIKEY_LOCALE_CURRENCY,
+        "X-DIGIKEY-Locale-Site": "IN",
+        "X-DIGIKEY-Locale-Language": "DIGIKEY_LOCALE_LANGUAGE",
+        "X-DIGIKEY-Locale-Currency": "INR",
         "Content-Type": "application/json",
     }
 
