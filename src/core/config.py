@@ -27,6 +27,17 @@ if AWS_REGION:
     os.environ.setdefault("AWS_REGION", AWS_REGION)
     os.environ.setdefault("AWS_REGION_NAME", AWS_REGION)
 
+# Embedding model (Bedrock via LiteLLM) for pgvector RAG over image/file chunks.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bedrock/amazon.titan-embed-text-v2:0").strip().strip('"').strip("'")
+EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "").strip().strip('"').strip("'")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "").strip().strip('"').strip("'")
+EMBEDDING_DIM = int((os.getenv("EMBEDDING_DIM", "1024").strip().strip('"').strip("'")) or "1024")
+EMBEDDING_SEND_DIMENSIONS = os.getenv("EMBEDDING_SEND_DIMENSIONS", "true").strip().strip('"').strip("'").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
 # Tavily web search tool.
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 

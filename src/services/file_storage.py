@@ -11,7 +11,6 @@ from PIL import Image
 from supabase import Client, create_client
 
 from src.core.config import (
-    DIRECT_URL,
     STORAGE_BUCKET_COMPRESSED,
     STORAGE_BUCKET_ORIGINAL,
     SUPABASE_SERVICE_KEY,
@@ -21,8 +20,10 @@ from src.core.config import (
 pillow_heif.register_heif_opener()
 
 IMAGE_EXTS = {"png", "jpg", "jpeg", "heic", "heif"}
-DOC_EXTS = {"pdf", "docx", "xlsx"}
+DOC_EXTS = {"pdf", "docx", "txt", "xlsx"}
 ALLOWED_EXTS = IMAGE_EXTS | DOC_EXTS
+
+MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 _supabase: Client | None = None
 
@@ -32,41 +33,6 @@ def get_supabase() -> Client:
     if _supabase is None:
         _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     return _supabase
-
-
-def ensure_files_table() -> None:
-    """Create uploaded_files table if it does not exist."""
-    if not DIRECT_URL:
-        return
-
-    import psycopg2
-
-    ddl = """
-    CREATE TABLE IF NOT EXISTS uploaded_files (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name TEXT NOT NULL,
-        original_url TEXT NOT NULL,
-        compressed_url TEXT,
-        file_type TEXT NOT NULL,
-        mime_type TEXT,
-        size_bytes BIGINT,
-        image_analysis TEXT,
-        image_analysis_status TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    """
-    migration = """
-    ALTER TABLE uploaded_files ADD COLUMN IF NOT EXISTS image_analysis TEXT;
-    ALTER TABLE uploaded_files ADD COLUMN IF NOT EXISTS image_analysis_status TEXT;
-    """
-    conn = psycopg2.connect(DIRECT_URL)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-            cur.execute(migration)
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _ext(filename: str) -> str:
@@ -154,6 +120,9 @@ async def upload_file(
             f"Unsupported file type '.{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTS))}"
         )
 
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError("File too large. Maximum allowed size is 10 MB.")
+
     file_id = str(uuid.uuid4())
     is_image = ext in IMAGE_EXTS
     file_type = "image" if is_image else "document"
@@ -182,7 +151,7 @@ async def upload_file(
         "file_type": file_type,
         "mime_type": mime,
         "size_bytes": len(data),
-        "image_analysis_status": "processing" if is_image else None,
+        "processing_status": "pending",
         "user_id": user_id,
         "project_id": project_id,
     }
@@ -191,10 +160,18 @@ async def upload_file(
     result = client.table("uploaded_files").insert(row).execute()
     record = result.data[0] if result.data else row
 
-    if is_image and compressed_data is not None:
-        from src.services.image_analysis import schedule_image_analysis
+    # Hand the heavy work to the RQ worker so the upload request returns fast.
+    from src.services.queue import (
+        enqueue_document_processing,
+        enqueue_image_processing,
+    )
 
-        schedule_image_analysis(file_id, compressed_data, project_id)
+    if is_image and compressed_data is not None:
+        enqueue_image_processing(
+            file_id, project_id, user_id, compressed_data, filename
+        )
+    elif not is_image:
+        enqueue_document_processing(file_id, project_id, user_id, data, ext, filename)
 
     return record
 
@@ -206,7 +183,7 @@ async def list_files(user_id: str, project_id: str) -> list[dict[str, Any]]:
         client.table("uploaded_files")
         .select(
             "id, name, original_url, compressed_url, file_type, mime_type, "
-            "size_bytes, image_analysis, image_analysis_status, created_at, project_id"
+            "size_bytes, processing_status, created_at, project_id"
         )
         .eq("user_id", user_id)
         .eq("project_id", project_id)
@@ -217,14 +194,14 @@ async def list_files(user_id: str, project_id: str) -> list[dict[str, Any]]:
 
 
 def get_files_by_ids(file_ids: list[str]) -> list[dict[str, Any]]:
-    """Fetch file metadata and image analysis for the given IDs."""
+    """Fetch file metadata and processing status for the given IDs."""
     if not file_ids:
         return []
 
     client = get_supabase()
     result = (
         client.table("uploaded_files")
-        .select("id, name, file_type, image_analysis, image_analysis_status")
+        .select("id, name, file_type, processing_status, project_id")
         .in_("id", file_ids)
         .execute()
     )
@@ -263,6 +240,15 @@ async def delete_file(file_id: str, user_id: str) -> bool:
         )
         if compressed_path:
             client.storage.from_(STORAGE_BUCKET_COMPRESSED).remove([compressed_path])
+
+    # Remove derived RAG chunks and the per-upload insight so deleted files don't
+    # linger in search results. (The project_knowledge_base row is an accumulated
+    # merge and is not un-merged here.)
+    for table in ("image_chunks", "file_chunks", "project_insights"):
+        try:
+            client.table(table).delete().eq("file_id", file_id).execute()
+        except Exception:
+            pass
 
     client.table("uploaded_files").delete().eq("id", file_id).eq(
         "user_id", user_id

@@ -4,8 +4,10 @@ websockets
 python-dotenv
 python-multipart
 redis
+rq
 langgraph
 langchain
+langchain-text-splitters
 deepagents
 langchain-litellm
 langchain-tavily
@@ -13,3 +15,6 @@ supabase
 Pillow
 pillow-heif
 psycopg2-binary
+pypdf
+docx2txt
+openpyxl

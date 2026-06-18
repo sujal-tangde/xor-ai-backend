@@ -1,6 +1,9 @@
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.agent.chat_agent import get_agent
 from src.core.config import APP_NAME
 from src.core.db import ensure_schema
 from src.routers import auth, chat, files, health, projects
@@ -9,8 +12,9 @@ app = FastAPI(title=APP_NAME)
 
 
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     ensure_schema()
+    await asyncio.to_thread(get_agent)
 
 # Allow the frontend to connect (tighten allow_origins for production).
 app.add_middleware(

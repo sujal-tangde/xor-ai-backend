@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from src.core.auth import get_current_user
 from src.services import projects_service as ps
-from src.services.file_storage import delete_file, list_files, upload_file
+from src.services.file_storage import MAX_FILE_BYTES, delete_file, list_files, upload_file
 
 router = APIRouter(tags=["files"])
 
@@ -22,6 +22,11 @@ async def upload(
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
+
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=400, detail="File too large. Maximum allowed size is 10 MB."
+        )
 
     try:
         record = await upload_file(

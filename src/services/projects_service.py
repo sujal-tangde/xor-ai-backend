@@ -72,6 +72,68 @@ def get_project_context(project_id: str) -> dict[str, Any] | None:
     return result.data[0] if result.data else None
 
 
+def get_project_knowledge_base(project_id: str) -> dict[str, Any] | None:
+    """Fetch a project's recomputed whole-product knowledge base row.
+
+    Replaces the old projects.context/structured_context read; the agent's
+    get_project_context tool now sources from here.
+    """
+    result = (
+        get_supabase()
+        .table("project_knowledge_base")
+        .select(
+            "project_id, theory_context, structured_context, "
+            "insights_total, insights_processed, status, updated_at"
+        )
+        .eq("project_id", project_id)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def list_uploads(project_id: str) -> list[dict[str, Any]]:
+    """List all uploads for a project with their processing status."""
+    result = (
+        get_supabase()
+        .table("uploaded_files")
+        .select("id, name, file_type, processing_status, created_at")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
+def get_insight(project_id: str, file_id: str) -> dict[str, Any] | None:
+    """Fetch a single upload's insight (theory + structured)."""
+    result = (
+        get_supabase()
+        .table("project_insights")
+        .select("file_id, media_kind, theory_context, structured_context, created_at")
+        .eq("project_id", project_id)
+        .eq("file_id", file_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def get_insights(project_id: str, file_ids: list[str]) -> list[dict[str, Any]]:
+    """Fetch insights for several file_ids in one call."""
+    if not file_ids:
+        return []
+    result = (
+        get_supabase()
+        .table("project_insights")
+        .select("file_id, media_kind, theory_context, structured_context")
+        .eq("project_id", project_id)
+        .in_("file_id", file_ids)
+        .execute()
+    )
+    return result.data or []
+
+
 def update_project(
     user_id: str, project_id: str, fields: dict[str, Any]
 ) -> dict[str, Any] | None:

@@ -90,13 +90,6 @@ async def chat_socket(websocket: WebSocket):
 
             chat_id = str(chat_id)
 
-            conv = await _resolve(chat_id)
-            if conv is None:
-                await websocket.send_json(
-                    {"role": "error", "content": "Conversation not found."}
-                )
-                continue
-
             if data.get("type") == "load_history":
                 await _hydrate_if_needed(chat_id)
                 history = await get_messages(chat_id)
@@ -127,9 +120,27 @@ async def chat_socket(websocket: WebSocket):
                 file_ids = [str(file_id) for file_id in raw_file_ids if file_id]
 
             try:
-                await _hydrate_if_needed(chat_id)
+                raw_project_id = data.get("project_id")
+                fast_new_chat = bool(raw_project_id)
+
+                if not fast_new_chat:
+                    await _hydrate_if_needed(chat_id)
+
                 history = await get_messages(chat_id)
                 was_empty = len(history) == 0
+
+                if fast_new_chat and was_empty:
+                    project_id = str(raw_project_id)
+                    verified[chat_id] = {"project_id": project_id}
+                else:
+                    conv = await _resolve(chat_id)
+                    if conv is None:
+                        await websocket.send_json(
+                            {"role": "error", "content": "Conversation not found."}
+                        )
+                        continue
+                    project_id = conv.get("project_id")
+
                 user_message: dict = {"role": "user", "content": str(message)}
                 if file_ids:
                     user_message["file_ids"] = file_ids
@@ -141,7 +152,6 @@ async def chat_socket(websocket: WebSocket):
 
                 reply_parts: list[str] = []
                 tools_used: list[dict[str, str]] = []
-                project_id = conv.get("project_id")
                 async for event in chat_stream(agent_messages, project_id):
                     event_type = event.get("type")
                     if event_type == "reset":

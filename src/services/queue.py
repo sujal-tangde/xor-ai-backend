@@ -1,0 +1,83 @@
+"""RQ (Redis Queue) wiring for background processing jobs.
+
+The upload API enqueues image/document processing here and returns immediately;
+a separate ``rq worker`` process (see ``backend/worker.py``) runs the jobs.
+Job functions are referenced by dotted path so the worker can import them
+without the FastAPI app being loaded.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from redis import Redis
+from rq import Queue
+
+from src.core.config import REDIS_URL
+
+logger = logging.getLogger(__name__)
+
+QUEUE_NAME = "xor-processing"
+# Generous timeout: a document map/reduce can involve several LLM calls.
+JOB_TIMEOUT = 1800
+
+_redis: Redis | None = None
+_queue: Queue | None = None
+
+
+def get_redis() -> Redis:
+    global _redis
+    if _redis is None:
+        _redis = Redis.from_url(REDIS_URL)
+    return _redis
+
+
+def get_queue() -> Queue:
+    global _queue
+    if _queue is None:
+        _queue = Queue(QUEUE_NAME, connection=get_redis())
+    return _queue
+
+
+def _enqueue(func_path: str, *args) -> None:
+    try:
+        get_queue().enqueue(func_path, *args, job_timeout=JOB_TIMEOUT)
+    except Exception:
+        # If Redis is down we don't want the upload request to fail; the file is
+        # already stored and can be reprocessed. Log and move on.
+        logger.exception("Failed to enqueue %s", func_path)
+
+
+def enqueue_image_processing(
+    file_id: str, project_id: str, user_id: str, compressed_jpeg: bytes, file_name: str
+) -> None:
+    _enqueue(
+        "src.services.file_processing.process_image",
+        file_id,
+        project_id,
+        user_id,
+        compressed_jpeg,
+        file_name,
+    )
+
+
+def enqueue_document_processing(
+    file_id: str, project_id: str, user_id: str, raw_bytes: bytes, ext: str, file_name: str
+) -> None:
+    _enqueue(
+        "src.services.file_processing.process_document",
+        file_id,
+        project_id,
+        user_id,
+        raw_bytes,
+        ext,
+        file_name,
+    )
+
+
+def enqueue_knowledge_base_recompute(project_id: str, insight_id: str) -> None:
+    _enqueue(
+        "src.services.knowledge_base.recompute_knowledge_base",
+        project_id,
+        insight_id,
+    )
