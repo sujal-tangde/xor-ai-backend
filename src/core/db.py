@@ -122,6 +122,47 @@ CREATE TABLE IF NOT EXISTS project_knowledge_base (
 );
 CREATE INDEX IF NOT EXISTS idx_project_knowledge_base_project_id
     ON project_knowledge_base(project_id);
+
+-- Generated should-cost reports. The rendered PDF is stored inline as base64
+-- (reports are small) and served back through the reports download endpoint.
+CREATE TABLE IF NOT EXISTS reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL,
+    conversation_id UUID,
+    user_id UUID,
+    title TEXT,
+    volume INT,
+    markdown TEXT,
+    costs JSONB,
+    pdf_base64 TEXT,
+    status TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reports_project_id ON reports(project_id);
+CREATE INDEX IF NOT EXISTS idx_reports_conversation_id ON reports(conversation_id);
+
+-- Human-in-the-loop questions the report tool asked the user, with their
+-- answers. Insights extracted from answered questions are folded back into the
+-- project's insight pipeline in the background.
+CREATE TABLE IF NOT EXISTS report_questions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL,
+    conversation_id UUID,
+    user_id UUID,
+    report_id UUID,
+    question TEXT NOT NULL,
+    kind TEXT,
+    answer TEXT,
+    file_ids JSONB,
+    status TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    answered_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_report_questions_project_id
+    ON report_questions(project_id);
+CREATE INDEX IF NOT EXISTS idx_report_questions_conversation_id
+    ON report_questions(conversation_id);
 """
 
 MIGRATIONS_DDL = """
@@ -136,6 +177,8 @@ CREATE INDEX IF NOT EXISTS idx_uploaded_files_project_id ON uploaded_files(proje
 CREATE INDEX IF NOT EXISTS idx_uploaded_files_user_id ON uploaded_files(user_id);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq ON messages(conversation_id, seq);
+-- Generated-report metadata attached to an assistant message (report_id, title, volume).
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS report JSONB;
 """
 
 

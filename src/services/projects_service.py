@@ -259,7 +259,7 @@ def get_conversation_messages(
     result = (
         get_supabase()
         .table("messages")
-        .select("role, content, file_ids, tools_used, seq")
+        .select("role, content, file_ids, tools_used, report, seq")
         .eq("conversation_id", conversation_id)
         .order("seq", desc=True)
         .limit(limit)
@@ -274,6 +274,8 @@ def get_conversation_messages(
             msg["file_ids"] = row["file_ids"]
         if row.get("tools_used"):
             msg["tools_used"] = row["tools_used"]
+        if row.get("report"):
+            msg["report"] = row["report"]
         out.append(msg)
     return out
 
@@ -294,6 +296,7 @@ def save_messages(
                 "content": msg.get("content") or "",
                 "file_ids": msg.get("file_ids"),
                 "tools_used": msg.get("tools_used"),
+                "report": msg.get("report"),
             }
         )
     get_supabase().table("messages").insert(rows).execute()

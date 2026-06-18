@@ -2,13 +2,17 @@
 
 import json
 import re
+import uuid
 from collections.abc import AsyncIterator
 from datetime import date
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langchain_litellm import ChatLiteLLM
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 from deepagents import create_deep_agent
 
 from src.agent.tools import get_agent_tools, is_known_tool, tool_label
@@ -19,7 +23,38 @@ from src.core.config import (
     LLM_MODEL,
 )
 
-StreamEventType = Literal["delta", "reset", "tool_start", "tool_end", "tool_query", "tools_used"]
+StreamEventType = Literal[
+    "delta", "reset", "tool_start", "tool_end", "tool_query", "tools_used",
+    "questions", "report_progress", "report_ready",
+]
+
+# Skills (deepagents): the PDF-report skill is injected into the agent's
+# in-memory backend on each invocation via the `files` channel.
+_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+_SKILLS_SOURCE = "/skills/"
+
+
+def _load_skill_files() -> dict[str, dict[str, str]]:
+    """Read bundled SKILL.md files into the StateBackend `files` shape."""
+    files: dict[str, dict[str, str]] = {}
+    if not _SKILLS_DIR.is_dir():
+        return files
+    for skill_md in _SKILLS_DIR.glob("*/SKILL.md"):
+        skill_name = skill_md.parent.name
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        files[f"{_SKILLS_SOURCE}{skill_name}/SKILL.md"] = {
+            "content": content,
+            "encoding": "utf-8",
+        }
+    return files
+
+
+@lru_cache(maxsize=1)
+def _skill_files() -> dict[str, dict[str, str]]:
+    return _load_skill_files()
 
 # Greetings / small talk — routed around the tool-calling agent (models often
 # ignore "don't call tools" in the system prompt when tools are available).
@@ -135,12 +170,21 @@ def _build_model() -> ChatLiteLLM:
 
 @lru_cache(maxsize=1)
 def get_agent():
-    """Create (once) and return the compiled deep agent."""
+    """Create (once) and return the compiled deep agent.
+
+    A process-wide ``MemorySaver`` checkpointer is attached so the report tool's
+    HILT ``interrupt()`` can pause a turn and be resumed (via ``Command``) once
+    the user answers. Each user turn uses a fresh ``thread_id`` (see
+    ``chat_stream``) so checkpointed state never leaks between turns even though
+    we keep passing the full history ourselves.
+    """
     model = _build_model()
     return create_deep_agent(
         model=model,
         tools=get_agent_tools(),
         system_prompt=_system_prompt(),
+        skills=[_SKILLS_SOURCE],
+        checkpointer=MemorySaver(),
     )
 
 
@@ -292,42 +336,48 @@ async def _direct_chat_stream(
             yield {"type": "delta", "text": delta}
 
 
-async def chat_stream(
-    messages: list[dict[str, Any]],
-    project_id: str | None = None,
-) -> AsyncIterator[dict[str, Any]]:
-    """Stream assistant events for a conversation history.
+def _agent_config(
+    thread_id: str,
+    project_id: str | None,
+    user_id: str | None,
+    conversation_id: str | None,
+) -> dict[str, Any]:
+    """Build the LangGraph config that threads request context into tools."""
+    return {
+        "configurable": {
+            "thread_id": thread_id,
+            "project_id": project_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+        }
+    }
 
-    Yields dicts with a ``type`` key:
-      - ``delta``: ``{"type": "delta", "text": "..."}``
-      - ``reset``: ``{"type": "reset"}`` — new assistant message after a tool call
-      - ``tool_start``: ``{"type": "tool_start", "tool": "...", "label": "..."}``
-      - ``tool_query``: ``{"type": "tool_query", "tool": "...", "query": "..."}``
-      - ``tool_end``: ``{"type": "tool_end", "tool": "...", "label": "..."}``
-      - ``tools_used``: ``{"type": "tools_used", "tools": [...]}`` — final summary
+
+async def _stream_agent_events(
+    agent_input: Any,
+    config: dict[str, Any],
+    thread_id: str,
+) -> AsyncIterator[dict[str, Any]]:
+    """Run the agent and translate LangGraph output into UI events.
+
+    Streams three LangGraph channels at once:
+      - ``messages``: token deltas + tool-call lifecycle.
+      - ``custom``: the report tool's progress / ready events (``get_stream_writer``).
+      - ``updates``: surfaces ``__interrupt__`` so HILT questions can be delivered.
+
+    On an interrupt a ``questions`` event (carrying ``thread_id``) is emitted and
+    the generator returns; the caller resumes via :func:`resume_stream`.
     """
     agent = get_agent()
-    use_tools = _needs_tools(messages)
-    lc_messages = _to_lc_messages(
-        messages,
-        project_id,
-        inject_project_hint=use_tools,
-    )
-
-    if not use_tools:
-        async for event in _direct_chat_stream(lc_messages):
-            yield event
-        return
-
     current_id: str | None = None
     # One record per tool *call*, tracked by a stable key so repeated calls of
-    # the same tool are all captured (the old code announced each tool name only
-    # once). Streamed argument fragments are keyed by the call's ``index``; the
-    # call ``id`` lets us match the eventual ToolMessage back to its record.
+    # the same tool are all captured. Argument fragments are keyed by the call's
+    # ``index``; the call ``id`` matches the eventual ToolMessage to its record.
     calls: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     id_to_key: dict[str, str] = {}
     synthetic = 0
+    interrupted = False
 
     def _record(key: str, name: str | None = None) -> dict[str, Any]:
         rec = calls.get(key)
@@ -341,12 +391,49 @@ async def chat_stream(
             rec["label"] = tool_label(name)
         return rec
 
-    async for chunk, _metadata in agent.astream(
-        {"messages": lc_messages},
-        stream_mode="messages",
+    async for mode, chunk in agent.astream(
+        agent_input,
+        config=config,
+        stream_mode=["updates", "messages", "custom"],
     ):
-        if isinstance(chunk, AIMessageChunk):
-            for tool_chunk in chunk.tool_call_chunks or []:
+        if mode == "custom":
+            if isinstance(chunk, dict):
+                kind = chunk.get("kind")
+                if kind == "report_progress":
+                    yield {
+                        "type": "report_progress",
+                        "stage": chunk.get("stage", ""),
+                        "message": chunk.get("message", ""),
+                    }
+                elif kind == "report_ready":
+                    yield {
+                        "type": "report_ready",
+                        "report_id": chunk.get("report_id"),
+                        "title": chunk.get("title"),
+                        "markdown": chunk.get("markdown"),
+                        "volume": chunk.get("volume"),
+                        "fx_rate": chunk.get("fx_rate"),
+                    }
+            continue
+
+        if mode == "updates":
+            if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                interrupts = chunk.get("__interrupt__") or ()
+                value = getattr(interrupts[0], "value", {}) if interrupts else {}
+                if isinstance(value, dict) and value.get("type") == "report_questions":
+                    interrupted = True
+                    yield {
+                        "type": "questions",
+                        "thread_id": thread_id,
+                        "questions": value.get("questions", []),
+                    }
+            continue
+
+        # mode == "messages": chunk is (message_chunk, metadata).
+        message_chunk = chunk[0] if isinstance(chunk, tuple) else chunk
+
+        if isinstance(message_chunk, AIMessageChunk):
+            for tool_chunk in message_chunk.tool_call_chunks or []:
                 index = tool_chunk.get("index")
                 key = f"idx:{index}" if index is not None else "idx:0"
                 rec = _record(key, tool_chunk.get("name"))
@@ -375,29 +462,29 @@ async def chat_stream(
                             "query": query,
                         }
 
-            if chunk.id and chunk.id != current_id:
+            if message_chunk.id and message_chunk.id != current_id:
                 if current_id is not None:
                     yield {"type": "reset"}
-                current_id = chunk.id
+                current_id = message_chunk.id
 
-            delta = _text(chunk.content)
+            delta = _text(message_chunk.content)
             if delta:
                 yield {"type": "delta", "text": delta}
             continue
 
-        if isinstance(chunk, ToolMessage):
-            call_id = getattr(chunk, "tool_call_id", None)
+        if isinstance(message_chunk, ToolMessage):
+            call_id = getattr(message_chunk, "tool_call_id", None)
             key = id_to_key.get(call_id) if call_id else None
             if key is None:
-                # Tool call never streamed as chunks (some providers deliver it
-                # whole) — synthesize a record so it still shows up.
+                # Tool call never streamed as chunks (whole-call providers, or a
+                # tool that resumed after an interrupt) — synthesize a record.
                 key = f"tm:{synthetic}"
                 synthetic += 1
-                _record(key, chunk.name)
+                _record(key, message_chunk.name)
             rec = calls[key]
-            if chunk.name and not rec["tool"]:
-                rec["tool"] = chunk.name
-                rec["label"] = tool_label(chunk.name)
+            if message_chunk.name and not rec["tool"]:
+                rec["tool"] = message_chunk.name
+                rec["label"] = tool_label(message_chunk.name)
             rec["ended"] = True
 
             if is_known_tool(rec["tool"]):
@@ -414,6 +501,10 @@ async def chat_stream(
                     "label": rec["label"],
                 }
 
+    if interrupted:
+        # Paused for HILT; tools_used is emitted after the resume completes.
+        return
+
     used_tools = [
         {"tool": calls[k]["tool"], "label": calls[k]["label"], "query": calls[k]["query"]}
         for k in order
@@ -421,3 +512,61 @@ async def chat_stream(
     ]
     if used_tools:
         yield {"type": "tools_used", "tools": used_tools}
+
+
+async def chat_stream(
+    messages: list[dict[str, Any]],
+    project_id: str | None = None,
+    *,
+    user_id: str | None = None,
+    conversation_id: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Stream assistant events for a conversation history.
+
+    Yields dicts with a ``type`` key:
+      - ``delta``: ``{"type": "delta", "text": "..."}``
+      - ``reset``: ``{"type": "reset"}`` — new assistant message after a tool call
+      - ``tool_start`` / ``tool_query`` / ``tool_end``: tool lifecycle
+      - ``tools_used``: ``{"type": "tools_used", "tools": [...]}`` — final summary
+      - ``report_progress``: ``{"type": "report_progress", "stage", "message"}``
+      - ``report_ready``: ``{"type": "report_ready", "report_id", "markdown", ...}``
+      - ``questions``: ``{"type": "questions", "thread_id", "questions": [...]}``
+        — HILT pause; resume with :func:`resume_stream` once answered.
+    """
+    use_tools = _needs_tools(messages)
+    lc_messages = _to_lc_messages(
+        messages,
+        project_id,
+        inject_project_hint=use_tools,
+    )
+
+    if not use_tools:
+        async for event in _direct_chat_stream(lc_messages):
+            yield event
+        return
+
+    thread_id = str(uuid.uuid4())
+    config = _agent_config(thread_id, project_id, user_id, conversation_id)
+    agent_input: dict[str, Any] = {"messages": lc_messages}
+    skill_files = _skill_files()
+    if skill_files:
+        # StateBackend reads skills from the `files` channel (see SkillsMiddleware).
+        agent_input["files"] = dict(skill_files)
+    async for event in _stream_agent_events(agent_input, config, thread_id):
+        yield event
+
+
+async def resume_stream(
+    thread_id: str,
+    answers: Any,
+    project_id: str | None = None,
+    *,
+    user_id: str | None = None,
+    conversation_id: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Resume a HILT-paused turn with the user's answers and stream the rest."""
+    config = _agent_config(thread_id, project_id, user_id, conversation_id)
+    async for event in _stream_agent_events(
+        Command(resume={"answers": answers}), config, thread_id
+    ):
+        yield event

@@ -49,6 +49,28 @@ KB_RELATEDNESS_THRESHOLD = float(
 # Tavily web search tool.
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
+# DigiKey API (component MPN resolution + pricing for should-cost reports).
+DIGIKEY_CLIENT_ID = os.getenv("DIGIKEY_CLIENT_ID", "").strip().strip('"').strip("'")
+DIGIKEY_CLIENT_SECRET = os.getenv("DIGIKEY_CLIENT_SECRET", "").strip().strip('"').strip("'")
+DIGIKEY_API_BASE = os.getenv("DIGIKEY_API_BASE", "https://api.digikey.com").strip().strip('"').strip("'")
+DIGIKEY_LOCALE_SITE = os.getenv("DIGIKEY_LOCALE_SITE", "US").strip().strip('"').strip("'")
+DIGIKEY_LOCALE_LANGUAGE = os.getenv("DIGIKEY_LOCALE_LANGUAGE", "en").strip().strip('"').strip("'")
+DIGIKEY_LOCALE_CURRENCY = os.getenv("DIGIKEY_LOCALE_CURRENCY", "USD").strip().strip('"').strip("'")
+
+# Report generation: default assumed production volume (units) for should-cost
+# when the user has not stated one, and the cap on how many HILT questions the
+# report tool may ask in one round (we keep this small to avoid annoying users).
+REPORT_DEFAULT_VOLUME = int(
+    (os.getenv("REPORT_DEFAULT_VOLUME", "1000").strip().strip('"').strip("'")) or "1000"
+)
+REPORT_MAX_QUESTIONS = int(
+    (os.getenv("REPORT_MAX_QUESTIONS", "4").strip().strip('"').strip("'")) or "4"
+)
+# Fallback USD→INR rate when Tavily is unavailable or cannot parse a spot rate.
+REPORT_USD_INR_FALLBACK = float(
+    (os.getenv("REPORT_USD_INR_FALLBACK", "85.0").strip().strip('"').strip("'")) or "85.0"
+)
+
 # Supabase (storage + Postgres metadata for uploads).
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip().strip('"').strip("'")

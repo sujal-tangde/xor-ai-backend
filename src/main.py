@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.agent.chat_agent import get_agent
 from src.core.config import APP_NAME
 from src.core.db import ensure_schema
-from src.routers import auth, chat, files, health, projects
+from src.routers import auth, chat, files, health, projects, reports
 
 app = FastAPI(title=APP_NAME)
 
@@ -30,3 +30,4 @@ app.include_router(chat.router)
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(projects.router, prefix="/api", tags=["projects"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
+app.include_router(reports.router, prefix="/api/reports", tags=["reports"])

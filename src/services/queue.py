@@ -81,3 +81,14 @@ def enqueue_knowledge_base_recompute(project_id: str, insight_id: str) -> None:
         project_id,
         insight_id,
     )
+
+
+def enqueue_qa_insight(
+    project_id: str, user_id: str | None, qa_pairs: list
+) -> None:
+    _enqueue(
+        "src.services.report_qa_ingest.ingest_qa_insight",
+        project_id,
+        user_id,
+        qa_pairs,
+    )

@@ -9,7 +9,12 @@
       "Bash(./venv/Scripts/python.exe -c \"from langchain_litellm import ChatLiteLLM; print\\('ok'\\)\")",
       "Bash(timeout 90 ./venv/Scripts/python.exe -c ' *)",
       "Bash(./venv/Scripts/python.exe -m pip install boto3)",
-      "PowerShell(python -m py_compile src/services/image_analysis.py src/services/projects_service.py src/services/file_storage.py src/agent/chat_agent.py src/agent/tools/__init__.py src/agent/tools/project_context_tool.py src/routers/chat.py; if \\($?\\) { \"OK\" })"
+      "PowerShell(python -m py_compile src/services/image_analysis.py src/services/projects_service.py src/services/file_storage.py src/agent/chat_agent.py src/agent/tools/__init__.py src/agent/tools/project_context_tool.py src/routers/chat.py; if \\($?\\) { \"OK\" })",
+      "Bash(python *)",
+      "Bash(./venv/Scripts/python.exe -)",
+      "Bash(./venv/Scripts/python.exe -m pip install xhtml2pdf markdown)",
+      "Bash(./venv/Scripts/python.exe -c \"import importlib; [print\\(m, 'OK'\\) for m in ['httpx','requests'] if importlib.util.find_spec\\(m\\)]\")",
+      "Bash(./venv/Scripts/python.exe -c \"import importlib.util as u; print\\('httpx', bool\\(u.find_spec\\('httpx'\\)\\)\\); print\\('requests', bool\\(u.find_spec\\('requests'\\)\\)\\)\")"
     ]
   }
 }
