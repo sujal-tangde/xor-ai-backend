@@ -8,7 +8,10 @@ import logging
 from langchain_core.tools import tool
 
 from src.agent.tools.validation import invalid_project_id_message, is_uuid
-from src.services.projects_service import get_project_knowledge_base
+from src.services.projects_service import (
+    get_project_knowledge_base,
+    get_project_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +53,16 @@ def get_project_context_tool(project_id: str) -> str:
     except Exception as exc:  # pragma: no cover - surfaced to the agent
         logger.exception("get_project_knowledge_base failed for %s", project_id)
         return f"Could not load the project knowledge base: {exc}"
+
+    # Refer to the project by name, never its UUID, in anything the user may see.
+    try:
+        project_name = get_project_name(project_id) or "this project"
+    except Exception:  # pragma: no cover - name is cosmetic, never block on it
+        project_name = "this project"
+
     if kb is None:
         return (
-            f"Project {project_id}: no knowledge base yet — nothing has been "
+            f'Project "{project_name}": no knowledge base yet — nothing has been '
             "analyzed for this project, or processing is still in progress."
         )
 
@@ -63,12 +73,12 @@ def get_project_context_tool(project_id: str) -> str:
 
     if not theory and not structured:
         return (
-            f"Project {project_id}: knowledge base exists but is still being "
+            f'Project "{project_name}": knowledge base exists but is still being '
             f"computed ({processed}/{total} uploads folded in). Try again shortly."
         )
 
     sections = [
-        f"Project knowledge base (ID: {project_id}) — "
+        f'Project "{project_name}" knowledge base — '
         f"{processed}/{total} uploads folded in:"
     ]
     if theory:

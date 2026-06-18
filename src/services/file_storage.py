@@ -97,6 +97,19 @@ def _compress_image_to_jpg(data: bytes) -> bytes:
     return best or result
 
 
+def _delete_derived_rows(client: Client, file_id: str) -> None:
+    """Remove a file's RAG chunks and per-upload insight (best effort).
+
+    Shared by re-upload replacement and deletion so a stale analysis never
+    lingers in search results once its source file is gone or replaced.
+    """
+    for table in ("image_chunks", "file_chunks", "project_insights"):
+        try:
+            client.table(table).delete().eq("file_id", file_id).execute()
+        except Exception:
+            pass
+
+
 def _upload_bytes(bucket: str, path: str, data: bytes, content_type: str) -> str:
     client = get_supabase()
     client.storage.from_(bucket).upload(
@@ -123,7 +136,24 @@ async def upload_file(
     if len(data) > MAX_FILE_BYTES:
         raise ValueError("File too large. Maximum allowed size is 10 MB.")
 
-    file_id = str(uuid.uuid4())
+    client = get_supabase()
+
+    # Re-upload with the same name (same user + project) replaces the existing
+    # file in place: we reuse its id so storage paths and any references stay
+    # stable, overwrite the bytes, and purge the old chunks/insight so the file
+    # is re-analyzed cleanly instead of leaving a duplicate behind.
+    existing = (
+        client.table("uploaded_files")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("project_id", project_id)
+        .eq("name", filename)
+        .limit(1)
+        .execute()
+    )
+    replacing = bool(existing.data)
+    file_id = existing.data[0]["id"] if replacing else str(uuid.uuid4())
+
     is_image = ext in IMAGE_EXTS
     file_type = "image" if is_image else "document"
     mime = content_type or "application/octet-stream"
@@ -156,8 +186,19 @@ async def upload_file(
         "project_id": project_id,
     }
 
-    client = get_supabase()
-    result = client.table("uploaded_files").insert(row).execute()
+    if replacing:
+        # Drop the previous analysis before re-processing the replacement bytes.
+        _delete_derived_rows(client, file_id)
+        update_fields = {k: v for k, v in row.items() if k not in ("id", "user_id")}
+        result = (
+            client.table("uploaded_files")
+            .update(update_fields)
+            .eq("id", file_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+    else:
+        result = client.table("uploaded_files").insert(row).execute()
     record = result.data[0] if result.data else row
 
     # Hand the heavy work to the RQ worker so the upload request returns fast.
@@ -244,11 +285,7 @@ async def delete_file(file_id: str, user_id: str) -> bool:
     # Remove derived RAG chunks and the per-upload insight so deleted files don't
     # linger in search results. (The project_knowledge_base row is an accumulated
     # merge and is not un-merged here.)
-    for table in ("image_chunks", "file_chunks", "project_insights"):
-        try:
-            client.table(table).delete().eq("file_id", file_id).execute()
-        except Exception:
-            pass
+    _delete_derived_rows(client, file_id)
 
     client.table("uploaded_files").delete().eq("id", file_id).eq(
         "user_id", user_id

@@ -111,7 +111,13 @@ def _system_prompt() -> str:
         "Combine stored evidence with web search when the user wants both hardware "
         "details and current external info (e.g. a part's datasheet or price). If "
         "you still don't know something after using the tools, say so instead of "
-        "guessing."
+        "guessing.\n\n"
+        "Never reveal internal identifiers. The project ID, file IDs, and insight "
+        "IDs (UUIDs like 'd3d6b64d-3705-...') are internal plumbing — pass them to "
+        "tools, but NEVER print them in your reply to the user. Always refer to a "
+        "project, file, or image by its human-readable name (e.g. \"the PCB top "
+        "photo\" or \"datasheet.pdf\"). If a file has no name, describe it (\"the "
+        "first uploaded image\") — do not fall back to its ID."
     )
 
 

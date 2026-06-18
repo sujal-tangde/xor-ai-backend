@@ -94,23 +94,22 @@ def get_upload_insight(project_id: str, file_id: str) -> str:
         return invalid_file_id_message(file_id)
 
     try:
+        files = {f["id"]: f for f in get_files_by_ids([file_id])}
+        name = (files.get(file_id) or {}).get("name") or "this file"
         record = get_insight(project_id, file_id)
         if record is None:
-            statuses = {
-                f["id"]: f.get("processing_status") for f in get_files_by_ids([file_id])
-            }
-            status = statuses.get(file_id)
+            status = (files.get(file_id) or {}).get("processing_status")
             if status and status != "complete":
                 return (
-                    f"File {file_id}: analysis is still {status}. Ask the user to wait "
+                    f'"{name}": analysis is still {status}. Ask the user to wait '
                     "a moment and try again."
                 )
-            return f"No insight found for file {file_id} in project {project_id}."
+            return f'No insight found for "{name}" in this project.'
     except Exception as exc:  # pragma: no cover - surfaced to the agent
         logger.exception("get_upload_insight failed for file %s", file_id)
         return f"Could not load that upload's analysis: {exc}"
 
-    return f"Insight for file {file_id}:\n\n{_format_insight(record)}"
+    return f'Insight for "{name}":\n\n{_format_insight(record)}'
 
 
 @tool(GET_INSIGHTS_BY_IDS_NAME)
@@ -143,26 +142,27 @@ def get_insights_by_file_ids(project_id: str, file_ids: list[str]) -> str:
 
     try:
         insights = {r["file_id"]: r for r in get_insights(project_id, valid_ids)}
-        statuses = {
-            f["id"]: f.get("processing_status") for f in get_files_by_ids(valid_ids)
-        }
+        files = {f["id"]: f for f in get_files_by_ids(valid_ids)}
     except Exception as exc:  # pragma: no cover - surfaced to the agent
         logger.exception("get_insights_by_file_ids failed for project %s", project_id)
         return f"Could not load the attached files' analysis: {exc}"
 
     for file_id in valid_ids:
+        # Refer to each file by name, never its UUID, in anything the user may see.
+        meta = files.get(file_id) or {}
+        name = meta.get("name") or "this file"
         record = insights.get(file_id)
         if record is not None:
-            sections.append(f"File {file_id}:\n{_format_insight(record)}")
+            sections.append(f'"{name}":\n{_format_insight(record)}')
             continue
-        status = statuses.get(file_id)
-        if status is None:
-            sections.append(f"File {file_id}: not found in this project.")
+        status = meta.get("processing_status") if meta else None
+        if not meta:
+            sections.append(f'"{name}": not found in this project.')
         elif status != "complete":
             sections.append(
-                f"File {file_id}: analysis still {status} — not ready yet. "
+                f'"{name}": analysis still {status} — not ready yet. '
                 "Tell the user its analysis is still pending."
             )
         else:
-            sections.append(f"File {file_id}: no insight stored.")
+            sections.append(f'"{name}": no insight stored.')
     return "\n\n---\n\n".join(sections)

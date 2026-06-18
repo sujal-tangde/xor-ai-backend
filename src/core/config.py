@@ -38,6 +38,14 @@ EMBEDDING_SEND_DIMENSIONS = os.getenv("EMBEDDING_SEND_DIMENSIONS", "true").strip
     "yes",
 }
 
+# Knowledge-base recompute: minimum cosine similarity between a new insight and
+# the project's existing accumulated analysis for the insight to be folded in.
+# Lenient by design — we only want to skip clearly-unrelated uploads (e.g. a
+# stray photo that has nothing to do with the product). Set to 0 to disable.
+KB_RELATEDNESS_THRESHOLD = float(
+    (os.getenv("KB_RELATEDNESS_THRESHOLD", "0.15").strip().strip('"').strip("'")) or "0.15"
+)
+
 # Tavily web search tool.
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 

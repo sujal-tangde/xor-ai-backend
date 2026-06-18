@@ -25,13 +25,11 @@ def _format_results(rows: list[dict[str, Any]], kind: str) -> str:
     if not rows:
         return f"No matching {kind} content found in this project."
     lines = [f"Top {kind} matches:"]
-    for row in rows:
+    for i, row in enumerate(rows, start=1):
         meta = row.get("metadata") or {}
         name = meta.get("file_name") if isinstance(meta, dict) else None
-        header = f"[file_id={row.get('file_id')}"
-        if name:
-            header += f" | {name}"
-        header += "]"
+        # Label by file name only — never expose the raw file_id to the user.
+        header = f"[{name}]" if name else f"[{kind} match {i}]"
         lines.append(f"{header}\n{(row.get('content') or '').strip()}")
     return "\n\n---\n\n".join(lines)
 

@@ -72,6 +72,22 @@ def get_project_context(project_id: str) -> dict[str, Any] | None:
     return result.data[0] if result.data else None
 
 
+def get_project_name(project_id: str) -> str | None:
+    """Fetch just a project's display name by ID (no user scoping).
+
+    Used to label tool output with a human-readable name instead of the UUID.
+    """
+    result = (
+        get_supabase()
+        .table("projects")
+        .select("name")
+        .eq("id", project_id)
+        .limit(1)
+        .execute()
+    )
+    return (result.data[0].get("name") if result.data else None) or None
+
+
 def get_project_knowledge_base(project_id: str) -> dict[str, Any] | None:
     """Fetch a project's recomputed whole-product knowledge base row.
 

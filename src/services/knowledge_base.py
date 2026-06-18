@@ -11,15 +11,77 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Any
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
 
-from src.core.config import DIRECT_URL
+from src.core.config import DIRECT_URL, KB_RELATEDNESS_THRESHOLD
 from src.services.llm_analysis import merge_dual
 
 logger = logging.getLogger(__name__)
+
+# Structured keys whose list lengths approximate "how much we know". Used by the
+# anti-shrink guard to detect a merge that silently dropped entries.
+_RICHNESS_LIST_KEYS = (
+    "components",
+    "connectors_io",
+    "architecture_blocks",
+    "design_observations",
+    "assumptions",
+)
+
+
+def _kb_text(theory: str, structured: dict[str, Any] | None) -> str:
+    """Flatten a (theory, structured) pair into one string for embedding."""
+    parts = [(theory or "").strip()]
+    if structured:
+        parts.append(json.dumps(structured, ensure_ascii=False))
+    return "\n\n".join(p for p in parts if p).strip()
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _is_related(existing_text: str, new_text: str) -> bool:
+    """True if the new insight is at least loosely related to the existing KB.
+
+    Fails open: any embedding error or a disabled threshold returns True so a
+    transient problem never blocks a legitimate merge.
+    """
+    if KB_RELATEDNESS_THRESHOLD <= 0:
+        return True
+    if not existing_text or not new_text:
+        return True
+    try:
+        from src.services.embeddings import embed_texts
+
+        vec_existing, vec_new = embed_texts([existing_text, new_text])
+        score = _cosine(vec_existing, vec_new)
+    except Exception:
+        logger.exception("Relatedness check failed; folding insight in anyway")
+        return True
+    logger.info("KB relatedness score %.3f (threshold %.3f)", score, KB_RELATEDNESS_THRESHOLD)
+    return score >= KB_RELATEDNESS_THRESHOLD
+
+
+def _richness(structured: dict[str, Any] | None) -> int:
+    """Rough count of recorded facts, used to detect a lossy merge."""
+    if not structured:
+        return 0
+    total = 0
+    for key in _RICHNESS_LIST_KEYS:
+        value = structured.get(key)
+        if isinstance(value, list):
+            total += len(value)
+    return total
 
 
 def _as_dict(value: Any) -> dict[str, Any] | None:
@@ -91,6 +153,21 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
                 # First insight for the project: KB becomes it verbatim, no LLM call.
                 merged_theory = new_theory
                 merged_structured = new_structured
+            elif not _is_related(
+                _kb_text(existing_theory, existing_structured),
+                _kb_text(new_theory, new_structured),
+            ):
+                # The new upload has nothing to do with this product (e.g. a stray
+                # photo). Don't fold it in and risk polluting the KB — keep the
+                # existing analysis untouched. The insight row still exists so the
+                # upload isn't lost; it's just not merged.
+                logger.info(
+                    "Insight %s is unrelated to project %s KB; skipping merge",
+                    insight_id,
+                    project_id,
+                )
+                merged_theory = existing_theory
+                merged_structured = existing_structured
             else:
                 merged_theory, merged_structured = merge_dual(
                     existing_theory,
@@ -98,7 +175,8 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
                     new_theory,
                     _structured_text(new_structured),
                 )
-                merged_theory = (merged_theory or "").strip() or existing_theory
+                merged_theory = (merged_theory or "").strip()
+
                 if merged_structured is None:
                     # Merge produced unparseable JSON — keep the previous structured
                     # context rather than corrupting it.
@@ -108,6 +186,32 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
                         project_id,
                     )
                     merged_structured = existing_structured or new_structured
+                elif _richness(merged_structured) < _richness(existing_structured):
+                    # Anti-shrink guard: the merge dropped recorded facts. Folding
+                    # in the new upload should never make us know LESS, so reject
+                    # the lossy result and keep the richer existing structured.
+                    logger.warning(
+                        "KB merge shrank structured context for project %s "
+                        "(%s -> %s facts); keeping previous structured_context",
+                        project_id,
+                        _richness(existing_structured),
+                        _richness(merged_structured),
+                    )
+                    merged_structured = existing_structured
+
+                # Same guard for the prose: never let the theory collapse to a
+                # fraction of what we already had.
+                if existing_theory and len(merged_theory) < 0.6 * len(existing_theory):
+                    logger.warning(
+                        "KB merge shrank theory for project %s "
+                        "(%s -> %s chars); keeping previous theory_context",
+                        project_id,
+                        len(existing_theory),
+                        len(merged_theory),
+                    )
+                    merged_theory = existing_theory
+                elif not merged_theory:
+                    merged_theory = existing_theory
 
             processed_now = processed + 1
 

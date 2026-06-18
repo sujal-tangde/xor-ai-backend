@@ -113,11 +113,13 @@ MERGE_CONTEXT_PROMPT = f"""You are an expert electronics reverse-engineering and
 You are given the project's EXISTING accumulated analysis (theory prose + structured JSON) and the NEW analysis just produced from an additional upload of the SAME product. Merge them into one consolidated, up-to-date analysis that reflects everything known so far.
 
 Merge rules:
+- The merged result MUST be a SUPERSET of the EXISTING analysis. This is the most important rule: never drop, shorten, or summarize away anything already recorded. Every component, connector, architecture block, design observation, assumption, spec, marking, and confidence/evidence reference already present MUST survive into the output unchanged unless the new upload gives a strictly better reading of that exact item.
 - Treat all inputs as views of the same product. Combine evidence; do not duplicate facts that appear in both.
-- Add anything new the latest upload reveals (newly visible components, markings, connectors, enclosure details, electrical specs).
-- When the new upload gives a clearer reading than before (e.g. a legible top-mark or a datasheet spec that was previously unknown), prefer the higher-confidence reading and update it.
+- Add anything new the latest upload reveals (newly visible components, markings, connectors, enclosure details, electrical specs) ON TOP OF everything already known.
+- When the new upload gives a clearer reading than before (e.g. a legible top-mark or a datasheet spec that was previously unknown), prefer the higher-confidence reading and update that one field — but do not delete the surrounding context.
 - Never invent values, markings, or prices. Keep anything still unknown as unknown/null. Preserve confidences (0-1) and evidence references.
-- Keep the component list exhaustive and de-duplicated: one entry per distinct IC, connector, crystal/oscillator, electromechanical part, LED, inductor, electrolytic/tantalum cap; group identical small passives into one entry with total qty.
+- Keep the component list exhaustive and de-duplicated: one entry per distinct IC, connector, crystal/oscillator, electromechanical part, LED, inductor, electrolytic/tantalum cap; group identical small passives into one entry with total qty. The merged component list must be at least as long as the existing one.
+- If the new upload adds nothing to a particular field or section, copy the existing value through verbatim. The theory prose must stay at least as detailed as the existing theory.
 
 Produce TWO outputs, in this exact order, separated by the exact delimiter lines shown.
 
