@@ -12,6 +12,11 @@ APP_NAME = "XOR Chat API"
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MAX_CHAT_MESSAGES = int(os.getenv("MAX_CHAT_MESSAGES", "20"))
 
+# Background processing: number of parallel worker processes to run from
+# worker.py. Each is an independent process consuming the same queue, so N
+# workers analyze N files concurrently. Scale this with available CPU/RAM.
+WORKER_COUNT = int((os.getenv("WORKER_COUNT", "1").strip().strip('"').strip("'")) or "1")
+
 # LLM (Bedrock via LiteLLM; must support tool calling for the deep agent).
 LLM_MODEL = os.getenv("LLM_MODEL", "bedrock/qwen.qwen3-vl-235b-a22b")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip().strip('"').strip("'")
