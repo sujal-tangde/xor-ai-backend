@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from src.core.auth import get_current_user
@@ -29,8 +30,13 @@ async def upload(
         )
 
     try:
-        record = await upload_file(
-            file.filename, data, file.content_type, user["id"], project_id
+        record = await asyncio.to_thread(
+            upload_file,
+            file.filename,
+            data,
+            file.content_type,
+            user["id"],
+            project_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

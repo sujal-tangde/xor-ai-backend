@@ -120,13 +120,20 @@ def _upload_bytes(bucket: str, path: str, data: bytes, content_type: str) -> str
     return _public_url(bucket, path)
 
 
-async def upload_file(
+def upload_file(
     filename: str,
     data: bytes,
     content_type: str | None,
     user_id: str,
     project_id: str,
 ) -> dict[str, Any]:
+    """Store + register an upload, then enqueue background processing.
+
+    This is fully synchronous (PIL compression + Supabase storage/DB calls) and
+    is intentionally a plain ``def``: the router runs it via ``asyncio.to_thread``
+    so the whole blocking sequence stays off the event loop and N concurrent
+    uploads run in parallel on the threadpool instead of serializing.
+    """
     ext = _ext(filename)
     if ext not in ALLOWED_EXTS:
         raise ValueError(
