@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
 from src.core.auth import get_current_user
-from src.services import reports as reports_service
+from src.services import report_template, reports as reports_service
 
 router = APIRouter(tags=["reports"])
 
@@ -24,6 +24,17 @@ async def get_report(report_id: str, user=Depends(get_current_user)):
     if record is None:
         raise HTTPException(status_code=404, detail="Report not found")
     report_json = record.get("report_json") or {}
+
+    # Prefer the stored markdown; if absent (reports created before markdown was
+    # persisted), render it on the fly from the structured JSON so the panel can
+    # always display something. Legacy markdown-only reports use their column.
+    markdown = record.get("markdown")
+    if not markdown and isinstance(report_json, dict) and report_json:
+        try:
+            markdown = report_template.render_markdown(report_json)
+        except Exception:
+            markdown = None
+
     return {
         "id": record["id"],
         "title": record.get("title"),
@@ -34,10 +45,7 @@ async def get_report(report_id: str, user=Depends(get_current_user)):
         "status": record.get("status"),
         "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),
-        # Legacy markdown reports (pre-migration) still render in the panel.
-        "markdown": reports_service.normalize_report_markdown(record.get("markdown") or "")
-        if record.get("markdown")
-        else None,
+        "markdown": reports_service.normalize_report_markdown(markdown) if markdown else None,
     }
 
 

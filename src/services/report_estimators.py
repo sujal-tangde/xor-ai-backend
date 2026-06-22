@@ -15,6 +15,7 @@ import json
 import logging
 from typing import Any
 
+from src.services.failure_log import record_failure
 from src.services.llm_analysis import invoke_llm, parse_json_object
 
 logger = logging.getLogger(__name__)
@@ -75,8 +76,13 @@ def resolve_mpns(components: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         )
         data = parse_json_object(raw) or {}
         resolutions = data.get("resolutions") or []
-    except Exception:
+    except Exception as exc:
         logger.warning("MPN resolution LLM call failed; using heuristic fallback", exc_info=True)
+        record_failure(
+            "resolving_mpns", "MPN resolution",
+            "Could not auto-resolve part numbers — falling back to category estimates",
+            error=exc, context={"component_count": len(slim)},
+        )
         resolutions = []
 
     out: dict[str, dict[str, Any]] = {}
@@ -129,8 +135,13 @@ def classify_hsns(components: list[dict[str, Any]]) -> dict[str, str]:
         )
         data = parse_json_object(raw) or {}
         rows = data.get("hsn") or []
-    except Exception:
+    except Exception as exc:
         logger.warning("HSN classification failed; duty will use defaults", exc_info=True)
+        record_failure(
+            "duty", "HSN classification",
+            "Could not classify HSN codes — applying default duty rates",
+            error=exc, context={"component_count": len(slim)},
+        )
         return {}
     out: dict[str, str] = {}
     for row in rows:
@@ -189,8 +200,13 @@ def estimate_non_quotable(structured: dict[str, Any]) -> dict[str, Any]:
             max_tokens=1500,
         )
         data = parse_json_object(raw)
-    except Exception:
+    except Exception as exc:
         logger.warning("Non-quotable estimate failed; using fallback rates", exc_info=True)
+        record_failure(
+            "non_quotable", "Non-quotable estimate",
+            "Could not estimate firmware/tooling/labour — using default reference rates",
+            error=exc, context={"component_count": context.get("component_count")},
+        )
         data = None
     if not isinstance(data, dict):
         return {**_NON_QUOTABLE_FALLBACK, "fallback": True}
@@ -255,8 +271,13 @@ def summarize_market(product_label: str, structured: dict[str, Any], snippets: s
             max_tokens=1500,
         )
         data = parse_json_object(raw) or {}
-    except Exception:
+    except Exception as exc:
         logger.warning("Market summary failed", exc_info=True)
+        record_failure(
+            "market_context", product_label or "market",
+            "Could not summarize web market context — omitting comparables",
+            error=exc,
+        )
         return {"observations": [], "comparables": [], "margin_band": None, "had_web": False}
     return {
         "observations": data.get("observations") if isinstance(data.get("observations"), list) else [],
@@ -274,6 +295,12 @@ _PROSE_PROMPT = """You are an expert electronics should-cost analyst and technic
 sections of a should-cost report. You are given the product analysis and the FINAL computed cost figures — \
 do NOT recompute, restate, or tabulate numbers; reference them only in narrative where useful. Write in a \
 professional, factual tone. All money is INR (₹). Never invent component prices.
+
+IMPORTANT: This is a SINGLE-UNIT cost report. Do NOT discuss production volumes, order quantities, volume \
+discounts, economies of scale, or how cost changes at 1k/10k units. Speak only about the per-unit cost. Do NOT \
+use the term "ex-works" — call it the "per-unit cost" or "unit cost". The one-time NRE \
+(``one_time_nre_inr_separate``) is a SEPARATE one-time investment — it is NOT part of the per-unit cost; never add \
+it into the unit figure or say the unit costs hundreds of thousands.
 
 Write these fields (Markdown prose, no headings, no tables, no code fences):
 - "executive_summary": 3-5 sentences: what the product is and the headline cost story.
@@ -301,18 +328,18 @@ DATA-QUALITY NOTES (plain strings):
 _PROSE_FALLBACK = {
     "executive_summary": "This report reconstructs the per-unit manufacturing cost of the product from a "
     "physical teardown, combining live component pricing, a PCB fabrication quote, customs duty and "
-    "estimated assembly and tooling costs. All figures are landed cost in Indian Rupees.",
+    "estimated assembly and tooling costs. All figures are single-unit landed cost in Indian Rupees.",
     "key_findings": [
-        "The bill of materials is the largest share of unit cost at production volume.",
-        "Assembly and tooling costs fall steeply as volume rises and NRE amortizes.",
+        "The bill of materials is the largest share of the per-unit cost.",
+        "Active components and the enclosure are the dominant cost lines.",
         "Some figures are industry estimates where live data was unavailable — confirm before quoting.",
     ],
     "architecture_analysis": "The electronics are organized into the functional blocks identified during the "
     "teardown, built around the main processing/control component and its supporting power and I/O circuitry.",
     "cost_driver_insight": "The highest-value active components and the enclosure tooling are the dominant "
     "cost levers in this design.",
-    "market_context": "The reconstructed landed cost leaves a typical margin band against comparable retail "
-    "units; sourcing risk centers on single-sourced active components.",
+    "market_context": "The reconstructed per-unit landed cost leaves a typical margin band against comparable "
+    "retail units; sourcing risk centers on single-sourced active components.",
     "data_confidence": "Most figures in this report are based on live sourcing data. Where a live figure was "
     "unavailable, an industry estimate was used — please confirm those before using the numbers in a quotation.",
 }
@@ -334,8 +361,13 @@ def write_prose(
             max_tokens=2000,
         )
         data = parse_json_object(raw)
-    except Exception:
+    except Exception as exc:
         logger.warning("Prose generation failed; using fallback copy", exc_info=True)
+        record_failure(
+            "rendering", "Report narrative",
+            "Could not generate the report narrative — using neutral fallback copy",
+            error=exc,
+        )
         data = None
     if not isinstance(data, dict):
         return dict(_PROSE_FALLBACK)

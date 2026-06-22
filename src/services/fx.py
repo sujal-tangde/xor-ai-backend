@@ -17,6 +17,7 @@ import threading
 import httpx
 
 from src.core.config import FRANKFURTER_API_BASE, REPORT_USD_INR_FALLBACK
+from src.services.failure_log import record_failure
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,19 @@ def fetch_usd_inr() -> dict[str, object]:
             return {"rate": round(rate, 4), "source": SOURCE_LIVE, "live": True}
     except Exception as exc:  # noqa: BLE001 - defensive
         logger.warning("Frankfurter FX lookup failed: %s", exc)
+        with _lock:
+            cached = _last_known_rate
+        record_failure(
+            "fx", "Frankfurter USD/INR",
+            "Live FX rate unavailable — using cached rate"
+            if cached is not None else "Live FX rate unavailable — using fallback rate (~85)",
+            error=exc,
+            context={"fallback_used": "cached" if cached is not None else "hardcoded",
+                     "cached_rate": cached, "hardcoded_rate": REPORT_USD_INR_FALLBACK},
+        )
+        if cached is not None:
+            return {"rate": round(cached, 4), "source": SOURCE_CACHED, "live": False}
+        return {"rate": float(REPORT_USD_INR_FALLBACK), "source": SOURCE_FALLBACK, "live": False}
 
     with _lock:
         cached = _last_known_rate

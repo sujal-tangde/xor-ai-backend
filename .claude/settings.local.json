@@ -18,7 +18,12 @@
       "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c ' *)",
       "Bash(./venv/Scripts/python.exe -m pip install playwright -q)",
       "Bash(./venv/Scripts/python.exe -m playwright install chromium)",
-      "Bash(rm -f test_render.html test_render.pdf)"
+      "Bash(rm -f test_render.html test_render.pdf)",
+      "Bash(yarn build *)",
+      "Bash(rm -rf logs)",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.services.report_template, src.routers.reports, src.agent.tools.report_tool; print\\('imports OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main; print\\('app imports OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool, src.services.report_template, src.services.report_pipeline; print\\('backend imports OK'\\)\")"
     ]
   }
 }

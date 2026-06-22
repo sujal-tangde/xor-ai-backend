@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from src.core.config import PCBWAY_API_BASE, PCBWAY_API_KEY
+from src.services.failure_log import record_failure
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +113,21 @@ def quote_board(pcb: dict[str, Any], qty: int) -> dict[str, Any] | None:
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - defensive
         logger.warning("PCBWay quote failed for qty %s: %s", qty, exc)
+        record_failure(
+            "fab_quote", "PCBWay quote",
+            "PCBWay API request failed — using the internal fab cost model",
+            error=exc, context={"qty": qty, "payload": build_payload(pcb, qty)},
+        )
         return None
 
     usd = _extract_usd_price(data)
     if usd is None:
         logger.warning("PCBWay returned no recognizable price for qty %s", qty)
+        record_failure(
+            "fab_quote", "PCBWay quote",
+            "PCBWay returned no recognizable price — using the internal fab cost model",
+            context={"qty": qty, "response_keys": list(data.keys()) if isinstance(data, dict) else None},
+        )
         return None
     return {"usd": round(usd, 4), "qty": qty, "raw": data}
 

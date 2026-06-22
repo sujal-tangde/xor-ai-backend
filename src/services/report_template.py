@@ -123,8 +123,6 @@ def _confidence_tag(level: str | None) -> str:
 def _cover(rj: dict[str, Any]) -> str:
     meta = rj.get("meta") or {}
     product = rj.get("product") or {}
-    fx = rj.get("fx") or {}
-    rate = fx.get("rate")
     return f"""
   <div class="cover">
     <div class="org">
@@ -135,11 +133,20 @@ def _cover(rj: dict[str, Any]) -> str:
     <p class="subtitle">{esc(product.get('name'))}{(' — ' + esc(product.get('subtitle'))) if product.get('subtitle') else ''}</p>
     <div class="docmeta">
       <div><div class="k">Product</div><div class="v">{esc(product.get('name'))}</div></div>
-      <div><div class="k">Target volume</div><div class="v">{int(meta.get('volume') or 0):,} units</div></div>
+      <div><div class="k">Cost basis</div><div class="v">{_basis_label(meta.get('volume'))}</div></div>
       <div><div class="k">Inputs</div><div class="v">{esc(meta.get('inputs'))}</div></div>
-      <div><div class="k">Reporting currency</div><div class="v">INR (₹){f' · 1 USD = ₹{rate}' if rate else ''}</div></div>
+      <div><div class="k">Reporting currency</div><div class="v">INR (₹)</div></div>
     </div>
   </div>"""
+
+
+def _basis_label(volume: Any) -> str:
+    """Cost basis shown on the cover/header — per-unit by default, qty if given."""
+    try:
+        v = int(volume or 1)
+    except (TypeError, ValueError):
+        v = 1
+    return "Per unit" if v <= 1 else f"{v:,} units"
 
 
 def _executive(rj: dict[str, Any]) -> str:
@@ -150,7 +157,7 @@ def _executive(rj: dict[str, Any]) -> str:
         f"<li>{esc(item)}</li>" for item in (product.get("key_findings") or [])
     )
     callout_cls = "callout" if dc.get("all_live") else "callout warn"
-    sel_vol = int(metrics.get("selected_volume") or 0)
+    bom_per_unit = (rj.get("bom") or {}).get("subtotal_inr")
     return f"""
   <section>
     <div class="sec-no">01</div>
@@ -158,19 +165,19 @@ def _executive(rj: dict[str, Any]) -> str:
     <p class="lead">{esc(product.get('summary_prose'))}</p>
     <div class="metrics">
       <div>
-        <div class="lbl">Ex-works unit cost @ {sel_vol:,} u</div>
+        <div class="lbl">Unit cost (1 unit)</div>
         <div class="val">{fmt_inr(metrics.get('ex_works_selected'))}</div>
-        <div class="meta">Landed BOM + conversion, pre-margin</div>
+        <div class="meta">Recurring per-unit · excl. one-time NRE</div>
       </div>
       <div>
-        <div class="lbl">Ex-works unit cost @ 10,000 u</div>
-        <div class="val">{fmt_inr(metrics.get('ex_works_at_10000'))}</div>
-        <div class="meta">Tooling &amp; NRE fully amortized</div>
+        <div class="lbl">BOM cost / unit</div>
+        <div class="val">{fmt_inr(bom_per_unit)}</div>
+        <div class="meta">Components, landed (incl. duty)</div>
       </div>
       <div>
-        <div class="lbl">One-time NRE</div>
+        <div class="lbl">One-time NRE (separate)</div>
         <div class="val">{fmt_inr(metrics.get('one_time_nre_inr'), 0)}</div>
-        <div class="meta">Tooling, firmware, line setup</div>
+        <div class="meta">Tooling, firmware, line setup — one-time</div>
       </div>
     </div>
     <div class="{callout_cls}"><strong>Data Confidence &amp; Notes.</strong> {esc(dc.get('prose'))}</div>
@@ -248,16 +255,17 @@ def _cost_by_stage(rj: dict[str, Any]) -> str:
     total = stages.get("total")
     bars += (
         f'<div class="stagerow" style="border-bottom:none;margin-top:4px">'
-        f'<div><div class="nm" style="color:var(--brand)">Total ex-works unit cost</div>'
-        f'<div class="ds">Before margin, outbound logistics and destination duties</div></div>'
+        f'<div><div class="nm" style="color:var(--brand)">Total unit cost (1 unit)</div>'
+        f'<div class="ds">Recurring per-unit cost · one-time NRE shown separately</div></div>'
         f'<div></div><div class="amt" style="font-size:15px;color:var(--brand)">{fmt_inr(total)}</div></div>'
     )
     return f"""
   <section>
     <div class="sec-no">04</div>
     <div class="sec-h">Cost by Manufacturing Stage</div>
-    <p class="lead">Per-unit ex-works cost at an order quantity of {vol:,} units, decomposed by standard
-    manufacturing stage. Bars are proportional to contribution.</p>
+    <p class="lead">Recurring per-unit cost for a single unit, decomposed by standard manufacturing stage.
+    One-time NRE (tooling, firmware, line setup) is reported separately and is not included here.
+    Bars are proportional to contribution.</p>
     {bars}
   </section>"""
 
@@ -350,29 +358,6 @@ def _fab_assembly(rj: dict[str, Any]) -> str:
   </section>"""
 
 
-def _cost_vs_volume(rj: dict[str, Any]) -> str:
-    vc = rj.get("volumeCurve") or {}
-    volumes = vc.get("volumes") or []
-    head = "".join(f'<th class="n">{v:,}</th>' for v in volumes)
-    body = ""
-    for row in vc.get("rows") or []:
-        cells = "".join(f'<td class="n">{fmt_inr(v)}</td>' for v in row.get("values") or [])
-        body += f"<tr><td>{esc(row.get('stage'))}</td>{cells}</tr>"
-    totals = "".join(f'<td class="n">{fmt_inr(t)}</td>' for t in vc.get("totals") or [])
-    return f"""
-  <section>
-    <div class="sec-no">07</div>
-    <div class="sec-h">Cost vs. Volume</div>
-    <p class="lead">Per-unit ex-works cost across order quantities. NRE-heavy stages (assembly, enclosure,
-    firmware) collapse as volume rises; the BOM floor is set by component price breaks.</p>
-    <table>
-      <thead><tr><th>Stage</th>{head}</tr></thead>
-      <tbody>{body}</tbody>
-      <tfoot><tr><td>Total ex-works / unit</td>{totals}</tr></tfoot>
-    </table>
-  </section>"""
-
-
 def _market(rj: dict[str, Any]) -> str:
     mc = rj.get("marketContext") or {}
     comparables = mc.get("comparables") or []
@@ -395,7 +380,7 @@ def _market(rj: dict[str, Any]) -> str:
     margin_line = f'<p class="note">Implied gross margin band: {esc(margin)} (approximate).</p>' if margin else ""
     return f"""
   <section>
-    <div class="sec-no">08</div>
+    <div class="sec-no">07</div>
     <div class="sec-h">Market Context</div>
     <p class="lead">{esc(mc.get('prose'))}</p>
     <div class="twocol">
@@ -426,7 +411,7 @@ def _methodology(rj: dict[str, Any]) -> str:
     )
     return f"""
   <section style="border-bottom:none">
-    <div class="sec-no">09</div>
+    <div class="sec-no">08</div>
     <div class="sec-h">Methodology &amp; Confidence</div>
     <table>
       <thead><tr><th>Stage</th><th>Data source</th><th>Method</th><th>Confidence</th></tr></thead>
@@ -434,6 +419,182 @@ def _methodology(rj: dict[str, Any]) -> str:
     </table>
     {dq_block}
   </section>"""
+
+
+# --------------------------------------------------------------------------- #
+# Markdown rendering (for the in-app preview panel — avoids the PDF's CSS).
+# The PDF still renders from render_html(); this is display-only and carries the
+# same numbers/structure as GitHub-flavored Markdown.
+# --------------------------------------------------------------------------- #
+def _mc(value: Any) -> str:
+    """Markdown table cell: stringify and escape pipes/newlines."""
+    if value is None:
+        return "—"
+    return str(value).replace("|", "\\|").replace("\n", " ").strip() or "—"
+
+
+def _tag_text(tag: str | None, source: str | None) -> str:
+    label = "Live" if str(tag).lower() == "live" else "Est"
+    return f"{label} · {source}" if source else label
+
+
+def _md_table(header: list[str], aligns: list[str], rows: list[list[str]]) -> str:
+    """Build ONE contiguous GFM table (no blank lines between header and rows)."""
+    lines = ["| " + " | ".join(header) + " |", "|" + "|".join(aligns) + "|"]
+    for row in rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def render_markdown(report_json: dict[str, Any]) -> str:
+    rj = report_json or {}
+    meta = rj.get("meta") or {}
+    product = rj.get("product") or {}
+    metrics = rj.get("metrics") or {}
+    fx = rj.get("fx") or {}
+    out: list[str] = []
+
+    # Header
+    out.append(f"# {meta.get('title') or 'Reverse Engineering Cost Report'}")
+    sub_bits = []
+    if product.get("subtitle"):
+        sub_bits.append(str(product["subtitle"]))
+    sub_bits.append("All costs in INR (₹)")
+    out.append("*" + " · ".join(sub_bits) + "*")
+
+    # 01 Executive Summary
+    out.append("## 01 · Executive Summary")
+    if product.get("summary_prose"):
+        out.append(str(product["summary_prose"]).strip())
+    bom_per_unit = (rj.get("bom") or {}).get("subtotal_inr")
+    out.append(_md_table(
+        ["Metric", "Value"], ["---", "---:"],
+        [
+            ["Unit cost (1 unit)", fmt_inr(metrics.get("ex_works_selected"))],
+            ["BOM cost / unit (landed)", fmt_inr(bom_per_unit)],
+            ["One-time NRE (separate)", fmt_inr(metrics.get("one_time_nre_inr"), 0)],
+        ],
+    ))
+    dc = rj.get("dataConfidence") or {}
+    if dc.get("prose"):
+        out.append(f"> **Data Confidence & Notes.** {dc['prose']}")
+    findings = product.get("key_findings") or []
+    if findings:
+        out.append("**Key findings.**\n" + "\n".join(f"- {f}" for f in findings))
+
+    # 02 Product Overview
+    out.append("## 02 · Product Overview")
+    overview = product.get("overview") or []
+    if overview:
+        out.append(_md_table(
+            ["Field", "Value"], ["---", "---"],
+            [[_mc(r.get("k")), _mc(r.get("v"))] for r in overview],
+        ))
+    subs = product.get("subsystems") or []
+    if subs:
+        out.append("**Identified subsystems & evidence quality**")
+        out.append(_md_table(
+            ["Subsystem", "Identification basis", "Conf."], ["---", "---", "---"],
+            [[_mc(s.get("subsystem")), _mc(s.get("basis")), _mc(s.get("confidence"))] for s in subs],
+        ))
+
+    # 03 Architecture Analysis
+    arch = rj.get("architecture") or {}
+    out.append("## 03 · Architecture Analysis")
+    if arch.get("prose"):
+        out.append(str(arch["prose"]).strip())
+    blocks = arch.get("blocks") or []
+    if blocks:
+        out.append("\n".join(
+            f"- **{_mc(b.get('block'))}** — {_mc(b.get('description'))}" for b in blocks
+        ))
+    if arch.get("insight"):
+        out.append(f"> **Cost-driver insight:** {arch['insight']}")
+
+    # 04 Cost by Manufacturing Stage
+    stages = rj.get("stages") or {}
+    out.append("## 04 · Cost by Manufacturing Stage (1 unit, recurring)")
+    stage_rows = [
+        [_mc(r.get("stage")), f"{r.get('pct', 0):.0f}%", fmt_inr(r.get("amount"))]
+        for r in stages.get("rows") or []
+    ]
+    stage_rows.append(["**Total unit cost (1 unit)**", "", f"**{fmt_inr(stages.get('total'))}**"])
+    out.append(_md_table(["Stage", "Share", "Per-unit"], ["---", "---:", "---:"], stage_rows))
+
+    # 05 Bill of Materials
+    bom = rj.get("bom") or {}
+    bom_rows = [
+        [
+            _mc(r.get("sno")), _mc(r.get("mpn")), _mc(r.get("make")), _mc(r.get("description")),
+            _mc(r.get("designator")), _mc(r.get("qty")), _mc(r.get("pkg")),
+            fmt_inr(r.get("unit_inr")), _mc(r.get("bcd_igst")), fmt_inr(r.get("ext_inr")),
+            _mc(_tag_text(r.get("tag"), r.get("source"))),
+        ]
+        for r in bom.get("rows") or []
+    ]
+    bom_rows.append(["", "", "", "", "", "", "", "", "**Subtotal**", f"**{fmt_inr(bom.get('subtotal_inr'))}**", ""])
+    out.append("## 05 · Bill of Materials")
+    out.append(_md_table(
+        ["S.No", "MPN", "Make", "Description", "Desig.", "Qty", "Pkg", "Unit ₹", "BCD/IGST", "Ext ₹", "Source"],
+        ["---:", "---", "---", "---", "---", "---:", "---", "---:", "---", "---:", "---"],
+        bom_rows,
+    ))
+    out.append("*Duty is modeled per-MPN from the inferred HSN code. Lines tagged Est are rate-card estimates.*")
+
+    # 06 PCB Fab & Assembly
+    fab = rj.get("fab") or {}
+    params = fab.get("params") or {}
+    asm = rj.get("assembly") or {}
+    out.append("## 06 · PCB Fabrication & Assembly Detail")
+    out.append("**A · PCB Fabrication — PCBWay**")
+    out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
+        ["Base material", _mc(params.get("Material") or "FR-4")],
+        ["Layers", _mc(params.get("layers"))],
+        ["Dimensions", f"{_mc(params.get('Length'))} × {_mc(params.get('width'))} mm"],
+        ["Thickness", f"{_mc(params.get('Thickness'))} mm"],
+        ["Surface finish", _mc(params.get("surface"))],
+        ["Source", _mc(_tag_text(fab.get("tag"), fab.get("source")))],
+        ["**Fab cost / board**", f"**{fmt_inr(fab.get('selected_inr'))}**"],
+    ]))
+    out.append("**B · PCB Assembly — SMT + THT**")
+    out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
+        ["Total solder joints", _mc(asm.get("total_joints"))],
+        ["Setup fee (NRE)", fmt_inr(asm.get("setup_fee_inr"), 0)],
+        ["Stencil (NRE)", fmt_inr(asm.get("stencil_fee_inr"), 0)],
+        ["Rate per joint", fmt_inr(asm.get("rate_per_joint_inr"), 2)],
+        ["Source", _mc(_tag_text(asm.get("tag"), asm.get("source")))],
+        ["**Assembly / board (per-unit)**", f"**{fmt_inr(asm.get('per_unit_inr'))}**"],
+    ]))
+
+    # 07 Market Context
+    mc = rj.get("marketContext") or {}
+    out.append("## 07 · Market Context")
+    if mc.get("prose"):
+        out.append(str(mc["prose"]).strip())
+    comparables = mc.get("comparables") or []
+    if comparables:
+        out.append(_md_table(
+            ["Comparable", "Retail MRP", "Note"], ["---", "---:", "---"],
+            [[_mc(c.get("name")), fmt_inr(c.get("retail_mrp_inr"), 0), _mc(c.get("note"))] for c in comparables],
+        ))
+    if mc.get("margin_band"):
+        out.append(f"*Implied gross margin band: {mc['margin_band']} (approximate).*")
+    obs = mc.get("observations") or []
+    if obs:
+        out.append("**Sourcing & supply observations**\n" + "\n".join(f"- {o}" for o in obs))
+
+    # 08 Methodology
+    out.append("## 08 · Methodology & Confidence")
+    out.append(_md_table(
+        ["Stage", "Data source", "Method", "Confidence"], ["---", "---", "---", "---"],
+        [[_mc(m.get("stage")), _mc(m.get("source")), _mc(m.get("method")), _mc(m.get("confidence"))]
+         for m in rj.get("methodology") or []],
+    ))
+    dq = rj.get("dataQuality") or []
+    if dq:
+        out.append("**Data quality notes**\n" + "\n".join(f"- {n}" for n in dq))
+
+    return "\n\n".join(out)
 
 
 def render_html(report_json: dict[str, Any]) -> str:
@@ -448,15 +609,14 @@ def render_html(report_json: dict[str, Any]) -> str:
         _cost_by_stage(rj),
         _bom(rj),
         _fab_assembly(rj),
-        _cost_vs_volume(rj),
         _market(rj),
         _methodology(rj),
         """
   <footer>
     Generated by the Elecbits Teardown Cost Engine. Figures are estimates for internal planning and carry the
-    confidence bands stated in Section 09. Live distributor pricing and FX are timestamped at generation and will
-    drift over time. All amounts are landed ex-works in Indian Rupees (₹) unless otherwise noted. This document is
-    not a vendor quotation and does not constitute a commercial offer.
+    confidence bands stated in Section 08. Live distributor pricing and FX are timestamped at generation and will
+    drift over time. All amounts are single-unit landed costs in Indian Rupees (₹) unless otherwise noted; one-time
+    NRE is shown separately. This document is not a vendor quotation and does not constitute a commercial offer.
   </footer>""",
     ])
     return (

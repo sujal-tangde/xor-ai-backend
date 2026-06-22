@@ -156,6 +156,7 @@ def create_report(
     volume: int | None,
     report_json: dict[str, Any],
     html: str,
+    markdown_text: str | None = None,
     pdf_path: str | None,
     pdf_url: str | None,
     status: str = "ready",
@@ -168,6 +169,7 @@ def create_report(
         "volume": volume,
         "report_json": report_json,
         "html": html,
+        "markdown": markdown_text,
         "pdf_path": pdf_path,
         "pdf_url": pdf_url,
         "status": status,
@@ -183,6 +185,7 @@ def update_report(
     volume: int | None = None,
     report_json: dict[str, Any] | None = None,
     html: str | None = None,
+    markdown_text: str | None = None,
     pdf_path: str | None = None,
     pdf_url: str | None = None,
     status: str | None = None,
@@ -196,6 +199,8 @@ def update_report(
         payload["report_json"] = report_json
     if html is not None:
         payload["html"] = html
+    if markdown_text is not None:
+        payload["markdown"] = markdown_text
     if pdf_path is not None:
         payload["pdf_path"] = pdf_path
     if pdf_url is not None:

@@ -27,6 +27,7 @@ from src.core.config import (
     REPORT_VOLUME_CURVE,
 )
 from src.services import duty, fx, mouser, pcbway, report_estimators
+from src.services.failure_log import record_failure
 
 logger = logging.getLogger(__name__)
 
@@ -326,8 +327,13 @@ def _tavily_snippets(query: str) -> str:
                             parts.append(str(item[key]))
             return "\n".join(parts)[:8000]
         return str(result)[:8000]
-    except Exception:
+    except Exception as exc:
         logger.warning("Tavily market lookup failed", exc_info=True)
+        record_failure(
+            "market_context", "Tavily web search",
+            "Web search for market context failed — proceeding without web comparables",
+            error=exc, context={"query": query},
+        )
         return ""
 
 
@@ -414,16 +420,21 @@ def _stage_amounts_at(
     non_quotable: dict[str, Any],
     volume: int,
 ) -> list[tuple[str, float]]:
-    """The six manufacturing-stage per-unit costs at an exact ``volume``."""
+    """The six per-unit RECURRING manufacturing-stage costs for a SINGLE unit.
+
+    One-time NRE (tooling, firmware dev, line setup) is reported separately and is
+    NOT amortized into the unit cost — so this figure is the true cost of one
+    unit's inputs and is volume-independent.
+    """
     fw, enc, fa = non_quotable["firmware"], non_quotable["enclosure"], non_quotable["final_assembly"]
     v = max(1, int(volume))
     return [
         ("Component BOM (landed)", _bom_landed_per_unit(lines, v)),
         ("PCB fabrication", round(_fab_at(fab, v), 2)),
-        ("PCB assembly", round(assembly["nre_inr"] / v + assembly["per_unit_inr"], 2)),
-        ("Firmware / programming", round(fw["nre_inr"] / v + fw["per_unit_inr"], 2)),
-        ("Enclosure & mechanical", round(enc["nre_inr"] / v + enc["per_unit_inr"], 2)),
-        ("Final assembly, test, pack", round(fa["nre_inr"] / v + fa["per_unit_inr"], 2)),
+        ("PCB assembly", round(assembly["per_unit_inr"], 2)),
+        ("Firmware / programming", round(fw["per_unit_inr"], 2)),
+        ("Enclosure & mechanical", round(enc["per_unit_inr"], 2)),
+        ("Final assembly, test, pack", round(fa["per_unit_inr"], 2)),
     ]
 
 
@@ -621,8 +632,13 @@ def run_pipeline(
 
         try:
             fab = fab_future.result()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Fab quote failed entirely; using heuristic", exc_info=True)
+            record_failure(
+                "fab_quote", "PCB fabrication",
+                "Fab quoting stage failed entirely — using the internal fab cost model",
+                error=exc, context={"volumes": price_volumes},
+            )
             fab = {"fab_by_volume": {v: pcbway.heuristic_quote_inr(pcb, v) for v in price_volumes},
                    "live": False, "fx": fx.fetch_usd_inr(), "source": "Internal fab model",
                    "tag": "Est", "params": pcbway.build_payload(pcb, 1000)}
@@ -637,8 +653,13 @@ def run_pipeline(
 
         try:
             non_quotable = nq_future.result()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Non-quotable estimate failed", exc_info=True)
+            record_failure(
+                "non_quotable", "Non-quotable estimate",
+                "Non-quotable stage failed entirely — using default reference rates",
+                error=exc,
+            )
             non_quotable = {**report_estimators._NON_QUOTABLE_FALLBACK, "fallback": True}
         if non_quotable.get("fallback"):
             data_quality.append(
@@ -649,8 +670,13 @@ def run_pipeline(
 
         try:
             market = mkt_future.result()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Market context failed", exc_info=True)
+            record_failure(
+                "market_context", product_label or "market",
+                "Market context stage failed entirely — omitting web comparables",
+                error=exc,
+            )
             market = {"observations": [], "comparables": [], "margin_band": None,
                       "had_web": False, "source": "Tavily (web)", "tag": "Est"}
         if not market.get("had_web") or not market.get("comparables"):
@@ -758,22 +784,21 @@ def aggregate(
          "method": "Live quote → INR" if fab.get("live") else "Area × layers rate-card",
          "confidence": "High" if fab.get("live") else "Medium"},
         {"stage": "PCB assembly", "source": "EMS rate card",
-         "method": "Per-joint model + amortized NRE", "confidence": "Medium"},
+         "method": "Per-joint model; one-time NRE separate", "confidence": "Medium"},
         {"stage": "Firmware / enclosure / labour", "source": "Indian EMS reference rates",
-         "method": "NRE + per-unit estimate", "confidence": "Low-Med"},
+         "method": "Per-unit estimate; one-time NRE separate", "confidence": "Low-Med"},
         {"stage": "Market context", "source": "Tavily (web)",
          "method": "Web comparables (low confidence)", "confidence": "Low"},
     ]
 
-    # Figures handed to the prose LLM (narration only — no recompute).
+    # Figures handed to the prose LLM (narration only — no recompute). This is a
+    # SINGLE-UNIT report, so no volume-scaling figures are exposed to the writer.
     figures = {
         "currency": "INR",
-        "volume": volume,
-        "ex_works_per_unit": total_at(volume) or stages["total"],
-        "ex_works_at_1000": total_at(1000),
-        "ex_works_at_10000": total_at(10000),
-        "one_time_nre_inr": one_time_nre,
-        "bom_subtotal_inr": round(bom_subtotal, 2),
+        "basis": "single unit (recurring cost; one-time NRE reported separately)",
+        "unit_cost_per_unit_recurring": stages["total"],
+        "one_time_nre_inr_separate": one_time_nre,
+        "bom_cost_per_unit_inr": round(bom_subtotal, 2),
         "stage_breakdown": stages["rows"],
         "live_lines": sum(1 for l in lines if l["tag"] == "Live"),
         "total_lines": len(lines),

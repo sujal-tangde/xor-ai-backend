@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from src.core.config import MOUSER_API_BASE, MOUSER_API_KEY
+from src.services.failure_log import record_failure
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +131,19 @@ def search_part(mpn: str) -> dict[str, Any] | None:
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - defensive: never crash the pipeline
         logger.warning("Mouser lookup failed for %s: %s", mpn, exc)
+        record_failure(
+            "pricing", mpn, "Mouser API request failed — using a rate-card estimate",
+            error=exc, context={"mpn": mpn, "endpoint": "search/partnumber"},
+        )
         return None
 
     results = (data or {}).get("SearchResults") or {}
     parts = results.get("Parts") or []
     if not parts:
+        record_failure(
+            "pricing", mpn, "Mouser returned no matching part — using a rate-card estimate",
+            context={"mpn": mpn, "mouser_errors": (data or {}).get("Errors")},
+        )
         return None
 
     # Prefer an exact MPN match; otherwise take the first part with price breaks.

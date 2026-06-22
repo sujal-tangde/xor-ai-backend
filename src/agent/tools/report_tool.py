@@ -31,6 +31,7 @@ from langchain_core.tools import tool
 from src.agent.tools.validation import invalid_project_id_message, is_uuid
 from src.core.config import REPORT_DEFAULT_VOLUME
 from src.services import report_builder, report_edit, report_pipeline, report_template, reports
+from src.services.failure_log import record_failure
 from src.services.projects_service import get_project_knowledge_base, get_project_name
 from src.services.queue import enqueue_qa_insight
 
@@ -109,18 +110,35 @@ def _cfg(config: RunnableConfig | None) -> dict[str, Any]:
 
 
 def _parse_volume(text: str) -> int | None:
+    """Pull a production volume ONLY when the user states it explicitly.
+
+    Requires an explicit quantity context — a unit word, a 'k' suffix, or a
+    'volume/qty of N' phrase — so a stray number in the message (e.g. "9") is
+    never mistaken for a production volume. Otherwise returns None (the caller
+    defaults to a per-unit basis).
+    """
     if not text:
         return None
-    match = re.search(r"(\d[\d,\.]*)\s*([kK])?\s*(?:units|pcs|pieces|qty|volume)?", text)
-    if not match:
-        return None
-    try:
-        value = float(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
-    if match.group(2):
-        value *= 1000
-    return int(value) if value > 0 else None
+    patterns = (
+        r"(\d[\d,\.]*)\s*([kK])\b",  # "10k"
+        r"(\d[\d,\.]*)\s*(?:units?|pcs|pieces|qty|quantity)\b",  # "5000 units"
+        r"(?:volume|qty|quantity)\s*(?:of|=|:|is)?\s*(\d[\d,\.]*)\s*([kK])?",  # "volume of 5000"
+        r"\bfor\s+(\d[\d,\.]*)\s*([kK])?\s*(?:units?|pcs|pieces)\b",  # "for 1000 units"
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except (ValueError, IndexError):
+            continue
+        groups = match.groups()
+        if len(groups) > 1 and groups[1] and groups[1].lower() == "k":
+            value *= 1000
+        if value > 0:
+            return int(value)
+    return None
 
 
 def _normalize_answer(raw: Any) -> dict[str, Any]:
@@ -159,14 +177,22 @@ def _render_store_stream(
 ) -> str | None:
     """Render HTML→PDF, upload to the bucket, persist JSON, and stream report_ready."""
     emit("rendering", "in_progress", "Building the report document…")
+    # HTML backs the downloadable PDF (full-fidelity CSS); markdown backs the
+    # in-app preview panel (no CSS quirks).
     html = report_template.render_html(report_json)
+    markdown_text = report_template.render_markdown(report_json)
 
     pdf_url = None
     report_id = existing_report_id
     try:
         pdf_bytes = reports.render_pdf_from_html(html)
-    except Exception:
+    except Exception as exc:
         logger.warning("PDF render failed", exc_info=True)
+        record_failure(
+            "rendering", title or "report",
+            "Could not render the report PDF — the report was saved without a PDF",
+            error=exc, context={"project_id": project_id, "report_id": existing_report_id},
+        )
         pdf_bytes = None
 
     emit("storing", "started", "Saving your report…")
@@ -181,6 +207,7 @@ def _render_store_stream(
                 volume=volume,
                 report_json=report_json,
                 html=html,
+                markdown_text=markdown_text,
                 pdf_path=pdf_path,
                 pdf_url=pdf_url,
             )
@@ -189,15 +216,20 @@ def _render_store_stream(
             record = reports.create_report(
                 project_id, conversation_id, user_id,
                 title=title, volume=volume, report_json=report_json,
-                html=html, pdf_path=None, pdf_url=None,
+                html=html, markdown_text=markdown_text, pdf_path=None, pdf_url=None,
             )
             report_id = record["id"] if record else None
             if report_id and pdf_bytes is not None:
                 pdf_path, pdf_url = reports.upload_report_pdf(report_id, pdf_bytes)
                 reports.update_report(report_id, pdf_path=pdf_path, pdf_url=pdf_url)
         emit("storing", "done", "Report saved.")
-    except Exception:
+    except Exception as exc:
         logger.warning("Report storage failed", exc_info=True)
+        record_failure(
+            "storing", title or "report",
+            "Could not finish saving the report (upload/persist failed)",
+            error=exc, context={"project_id": project_id, "report_id": report_id},
+        )
         emit("storing", "error", "We couldn't finish saving the report — please try again.")
         return report_id
 
@@ -206,7 +238,7 @@ def _render_store_stream(
         "kind": "report_ready",
         "report_id": report_id,
         "title": title,
-        "html": html,
+        "markdown": markdown_text,
         "pdf_url": pdf_url,
         "volume": volume,
         "fx_rate": (report_json.get("fx") or {}).get("rate"),
@@ -347,15 +379,10 @@ def report_generation_tool(
     emit("hilt", "done", "Got what I need.")
 
     # ---- Determine production volume ---------------------------------------- #
-    volume = _parse_volume(request)
-    if volume is None:
-        for qid, ans in answers_by_id.items():
-            if any(k in qid.lower() for k in ("volume", "qty", "unit")):
-                volume = _parse_volume(ans["answer"])
-                if volume:
-                    break
-    assumed_volume = volume is None
-    volume = volume or REPORT_DEFAULT_VOLUME
+    # The report is always for a SINGLE unit. We do not parse a production volume
+    # from the request — costs are the recurring per-unit cost, with one-time NRE
+    # reported separately (never amortized over a quantity).
+    volume = 1
 
     # ---- Steps 3–9: run the pipeline ---------------------------------------- #
     report_json = report_pipeline.run_pipeline(
@@ -365,10 +392,12 @@ def report_generation_tool(
         volume=volume,
         emit=emit,
     )
-    if assumed_volume:
-        report_json.setdefault("dataQuality", []).append(
-            f"Production volume wasn't specified — assumed {volume:,} units."
-        )
+    # The report is always single-unit: per-unit recurring cost, with one-time NRE
+    # (tooling/firmware/line setup) reported separately — never amortized in.
+    report_json.setdefault("dataQuality", []).append(
+        "Figures are the recurring cost to build a single unit. One-time tooling, firmware "
+        "and line-setup (NRE) is listed separately and is not included in the per-unit cost."
+    )
 
     # ---- Steps 10–11: render, store, stream --------------------------------- #
     title = report_json.get("meta", {}).get("title") or f"Should-Cost Report — {product_label}"
@@ -387,8 +416,8 @@ def report_generation_tool(
     total_lines = live + report_json.get("bom", {}).get("est_count", 0)
     note = "" if not report_json.get("dataQuality") else " Some figures use industry estimates where live data wasn't available — see the Data Confidence notes."
     return (
-        f'I generated the should-cost report "{title}" at {volume:,} units '
+        f'I generated the single-unit should-cost report "{title}" '
         f"({live} of {total_lines} BOM lines priced live).{note} "
-        "It's shown on the right and the PDF is ready to download. Want any changes — "
-        "different volume, a removed line, or more detail in a section?"
+        "It's the recurring cost to build one unit, with one-time tooling/NRE listed separately. "
+        "It's shown on the right and the PDF is ready to download — want a line removed or more detail in a section?"
     )

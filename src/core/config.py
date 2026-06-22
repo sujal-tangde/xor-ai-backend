@@ -61,7 +61,7 @@ DIGIKEY_LOCALE_CURRENCY = os.getenv("DIGIKEY_LOCALE_CURRENCY", "USD").strip().st
 # when the user has not stated one, and the cap on how many HILT questions the
 # report tool may ask in one round (we keep this small to avoid annoying users).
 REPORT_DEFAULT_VOLUME = int(
-    (os.getenv("REPORT_DEFAULT_VOLUME", "1000").strip().strip('"').strip("'")) or "1000"
+    (os.getenv("REPORT_DEFAULT_VOLUME", "1").strip().strip('"').strip("'")) or "1"
 )
 REPORT_MAX_QUESTIONS = int(
     (os.getenv("REPORT_MAX_QUESTIONS", "4").strip().strip('"').strip("'")) or "4"
@@ -123,6 +123,16 @@ ASSEMBLY_RATE_PER_JOINT_INR = float(
 
 # Supabase storage bucket for rendered report PDFs (path/URL stored, not base64).
 REPORTS_BUCKET = os.getenv("REPORTS_BUCKET", "reports").strip().strip('"').strip("'")
+
+# Folder for per-failure debug JSON files (one timestamped file per failed
+# external call / fallback during report generation). Best-effort; never blocks.
+REPORT_FAILURE_LOG_DIR = os.getenv(
+    "REPORT_FAILURE_LOG_DIR", "logs/report_failures"
+).strip().strip('"').strip("'")
+# Master switch: when false, no failure breadcrumb files are written at all.
+REPORT_FAILURE_LOG_ENABLED = os.getenv(
+    "REPORT_FAILURE_LOG_ENABLED", "true"
+).strip().strip('"').strip("'").lower() in {"1", "true", "yes"}
 
 # Supabase (storage + Postgres metadata for uploads).
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")
