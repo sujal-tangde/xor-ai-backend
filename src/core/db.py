@@ -123,8 +123,10 @@ CREATE TABLE IF NOT EXISTS project_knowledge_base (
 CREATE INDEX IF NOT EXISTS idx_project_knowledge_base_project_id
     ON project_knowledge_base(project_id);
 
--- Generated should-cost reports. The rendered PDF is stored inline as base64
--- (reports are small) and served back through the reports download endpoint.
+-- Generated should-cost reports. The aggregated structured JSON (report_json)
+-- is the source of truth for edits; the rendered PDF lives in the `reports`
+-- storage bucket (pdf_path/pdf_url), and `html` backs the live preview panel.
+-- Legacy markdown/costs/pdf_base64 columns are kept nullable for back-compat.
 CREATE TABLE IF NOT EXISTS reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL,
@@ -132,6 +134,10 @@ CREATE TABLE IF NOT EXISTS reports (
     user_id UUID,
     title TEXT,
     volume INT,
+    report_json JSONB,
+    html TEXT,
+    pdf_path TEXT,
+    pdf_url TEXT,
     markdown TEXT,
     costs JSONB,
     pdf_base64 TEXT,
@@ -179,6 +185,15 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq ON messages(conversation_id, seq);
 -- Generated-report metadata attached to an assistant message (report_id, title, volume).
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS report JSONB;
+
+-- Should-cost reports: store the aggregated structured JSON + rendered HTML, and
+-- the PDF in the `reports` storage bucket (path/URL only). The old inline base64
+-- column is retired (kept nullable for back-compat; no longer written to).
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS report_json JSONB;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS html TEXT;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_path TEXT;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_url TEXT;
+ALTER TABLE reports ALTER COLUMN pdf_base64 DROP NOT NULL;
 """
 
 

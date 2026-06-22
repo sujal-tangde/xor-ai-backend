@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reverse Engineering Cost Report — SoundWave Mini BT Speaker</title>
+<style>
+  :root{
+    --ink:#1a2230; --sub:#4a5568; --muted:#718096; --line:#e4e8ee; --hair:#eef1f5;
+    --brand:#143a5a; --brand-2:#1d4e77; --rule:#0f2e49;
+    --pos:#1c6b45; --neg:#9a3324; --warn:#8a5a00; --chipbg:#eef2f6;
+    --tablehdr:#f2f5f8;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{font-family:"Segoe UI",-apple-system,BlinkMacSystemFont,Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);margin:0;background:#eceff3;font-size:13px;line-height:1.55}
+  .doc{max-width:920px;margin:24px auto;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+
+  /* Cover */
+  .cover{padding:40px 48px 28px;border-bottom:3px solid var(--rule)}
+  .cover .org{display:flex;justify-content:space-between;align-items:flex-start;font-size:11px;color:var(--muted)}
+  .cover .org .logo{font-weight:800;letter-spacing:.04em;color:var(--brand);font-size:15px}
+  .cover .conf{text-transform:uppercase;letter-spacing:.14em;font-size:10px;color:var(--neg);font-weight:700}
+  .cover h1{font-size:25px;font-weight:700;margin:26px 0 4px;letter-spacing:-.01em}
+  .cover .subtitle{font-size:14px;color:var(--sub);font-weight:400;margin:0}
+  .docmeta{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);margin-top:26px}
+  .docmeta>div{padding:10px 14px;border-right:1px solid var(--line)}
+  .docmeta>div:last-child{border-right:none}
+  .docmeta .k{font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}
+  .docmeta .v{font-size:13px;font-weight:600;margin-top:3px}
+
+  /* Sections */
+  section{padding:26px 48px;border-bottom:1px solid var(--hair)}
+  .sec-no{font-size:11px;font-weight:700;color:var(--brand);letter-spacing:.04em}
+  .sec-h{font-size:17px;font-weight:700;margin:2px 0 14px;padding-bottom:8px;border-bottom:2px solid var(--rule)}
+  p{margin:0 0 11px}
+  .lead{color:var(--sub);max-width:74ch}
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:28px}
+  .threecol{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+
+  /* Tables — match reference: tabular, ₹, .toFixed(2) */
+  table{width:100%;border-collapse:collapse;font-size:12px;margin:6px 0 4px}
+  th{background:var(--tablehdr);text-align:left;padding:7px 9px;font-size:10px;text-transform:uppercase;
+    letter-spacing:.05em;color:var(--sub);font-weight:700;border-bottom:1.5px solid var(--rule)}
+  td{padding:6px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  tbody tr:nth-child(even) td{background:#fafbfc}
+  tfoot td{font-weight:700;background:#eef2f6;border-top:2px solid var(--rule);border-bottom:none}
+  .kv{width:100%;font-size:12.5px}
+  .kv td{padding:5px 0;border-bottom:1px solid var(--hair)}
+  .kv td:first-child{color:var(--sub);width:52%}
+  .kv td:last-child{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+
+  /* Summary metric cards */
+  .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:0;border:1px solid var(--line)}
+  .metrics>div{padding:16px 18px;border-right:1px solid var(--line)}
+  .metrics>div:last-child{border-right:none}
+  .metrics .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+  .metrics .val{font-size:23px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
+  .metrics .meta{font-size:11px;color:var(--muted);margin-top:3px}
+
+  /* Tag / source pills (reference uses source + confidence everywhere) */
+  .tag{display:inline-block;font-size:9.5px;font-weight:700;padding:1px 6px;border-radius:3px;
+    text-transform:uppercase;letter-spacing:.03em}
+  .tag.live{background:#e7f1ea;color:var(--pos)}
+  .tag.est{background:#f6efdf;color:var(--warn)}
+  .src{font-size:10px;color:var(--muted);display:block;margin-top:2px}
+
+  .callout{border-left:3px solid var(--brand);background:#f6f9fc;padding:11px 14px;font-size:12px;color:var(--sub);margin:12px 0}
+  .note{font-size:10.5px;color:var(--muted);margin-top:8px;font-style:italic}
+  ul.tight{margin:6px 0 11px;padding-left:18px}
+  ul.tight li{margin-bottom:4px;color:var(--sub)}
+
+  /* Stage bars */
+  .stagerow{display:grid;grid-template-columns:1fr 150px 86px;gap:14px;align-items:center;
+    padding:9px 0;border-bottom:1px solid var(--hair)}
+  .stagerow .nm{font-weight:600;font-size:12.5px}
+  .stagerow .ds{font-size:11px;color:var(--muted)}
+  .track{height:7px;background:#e9edf2;border-radius:4px;overflow:hidden}
+  .fill{height:100%;background:var(--brand)}
+  .stagerow .amt{text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+
+  .arch{display:grid;grid-template-columns:1fr;gap:0;border:1px solid var(--line);font-size:12px}
+  .arch .blk{display:grid;grid-template-columns:130px 1fr;border-bottom:1px solid var(--line)}
+  .arch .blk:last-child{border-bottom:none}
+  .arch .blk .h{background:var(--tablehdr);padding:8px 11px;font-weight:700;color:var(--brand-2);border-right:1px solid var(--line)}
+  .arch .blk .b{padding:8px 11px;color:var(--sub)}
+
+  footer{padding:18px 48px 30px;color:var(--muted);font-size:10.5px;line-height:1.5}
+  @media print{.doc{box-shadow:none;margin:0}}
+</style>
+</head>
+<body>
+<div class="doc">
+
+  <!-- COVER -->
+  <div class="cover">
+    <div class="org">
+      <span class="logo">ELECBITS · TEARDOWN COST ENGINE</span>
+      <span class="conf">Confidential — Internal</span>
+    </div>
+    <h1>Reverse Engineering Cost Report</h1>
+    <p class="subtitle">SoundWave Mini — Portable Bluetooth Speaker · End-to-end manufacturing cost reconstruction</p>
+    <div class="docmeta">
+      <div><div class="k">Report ID</div><div class="v">RE-2026-0419</div></div>
+      <div><div class="k">Generated</div><div class="v">19 Jun 2026</div></div>
+      <div><div class="k">Inputs</div><div class="v">37 photos · 1 PDF</div></div>
+      <div><div class="k">Reporting currency</div><div class="v">INR (₹)</div></div>
+    </div>
+  </div>
+
+  <!-- 01 EXECUTIVE SUMMARY -->
+  <section>
+    <div class="sec-no">01</div>
+    <div class="sec-h">Executive Summary</div>
+    <p class="lead">This report reconstructs the unit manufacturing cost of the SoundWave Mini portable
+    Bluetooth speaker from a physical teardown (37 component photographs) and a recovered specification
+    sheet. Costing follows standard electronics manufacturing stages — component sourcing, PCB fabrication,
+    PCB assembly, firmware, enclosure, and final assembly — with component pricing pulled live from
+    distributor APIs (Digi-Key, Mouser, LCSC, Arrow) and PCB fabrication quoted via the JLCPCB API.
+    All figures are landed cost in Indian Rupees, inclusive of basic customs duty (BCD), IGST and freight.</p>
+
+    <div class="metrics">
+      <div>
+        <div class="lbl">Ex-works unit cost @ 1,000 u</div>
+        <div class="val">₹1,243.00</div>
+        <div class="meta">Landed BOM + conversion, pre-margin</div>
+      </div>
+      <div>
+        <div class="lbl">Ex-works unit cost @ 10,000 u</div>
+        <div class="val">₹1,001.00</div>
+        <div class="meta">Tooling &amp; NRE fully amortized</div>
+      </div>
+      <div>
+        <div class="lbl">One-time NRE</div>
+        <div class="val">₹15,42,000</div>
+        <div class="meta">Injection tooling, firmware, line setup</div>
+      </div>
+    </div>
+
+    <p style="margin-top:16px"><strong>Key findings.</strong></p>
+    <ul class="tight">
+      <li>The bill of materials accounts for <strong>60%</strong> of ex-works cost at 1,000 units; the three
+      highest-value items (battery cell, BT SoC, acoustic driver) alone represent ₹487 / unit.</li>
+      <li>PCB assembly is the steepest volume-sensitive stage — it falls from ₹4,030 / unit at quantity 1 to
+      ₹146 / unit at 1,000 units as setup NRE amortizes.</li>
+      <li>Overall confidence is <strong>Medium-High (82%)</strong>; 21 of 31 line items carry vendor-verified
+      pricing. Battery and acoustic driver are market-index estimates and carry the widest error bands.</li>
+      <li>Estimated landed cost is competitive with comparable ₹1,400–1,900 retail-tier units, implying a
+      gross margin band of 45–60% at typical MRP.</li>
+    </ul>
+  </section>
+
+  <!-- 02 PRODUCT OVERVIEW -->
+  <section>
+    <div class="sec-no">02</div>
+    <div class="sec-h">Product Overview</div>
+    <div class="twocol">
+      <div>
+        <p class="lead">Identification was driven by manufacturer part numbers legible on PCB silkscreen in
+        close-up imagery, corroborated against the recovered specification sheet. The unit is a single-driver
+        mono portable speaker built on a Bluetooth 5.1 audio SoC with an integrated Class-D amplifier and an
+        18650 Li-ion cell.</p>
+        <table class="kv">
+          <tr><td>Form factor</td><td>Cylindrical portable, IP67</td></tr>
+          <tr><td>Acoustic driver</td><td>45 mm full-range, 5 W RMS</td></tr>
+          <tr><td>Wireless</td><td>Bluetooth 5.1 (BLE + Classic)</td></tr>
+          <tr><td>Battery</td><td>18650 Li-ion, 2,600 mAh</td></tr>
+          <tr><td>Charging</td><td>USB-C, 5 V / 1 A</td></tr>
+          <tr><td>Enclosure</td><td>ABS body + TPU overmould, fabric grille</td></tr>
+          <tr><td>Unit weight (measured)</td><td>312 g</td></tr>
+          <tr><td>Board count / unit</td><td>1 main + 1 button FPC</td></tr>
+        </table>
+      </div>
+      <div>
+        <p style="font-weight:600;margin-bottom:6px">Identified subsystems &amp; evidence quality</p>
+        <table>
+          <thead><tr><th>Subsystem</th><th>Identification basis</th><th>Conf.</th></tr></thead>
+          <tbody>
+            <tr><td>Main PCB (4-layer)</td><td>Silkscreen + photo</td><td><span class="tag live">High</span></td></tr>
+            <tr><td>BT 5.1 SoC</td><td>MPN on package</td><td><span class="tag live">High</span></td></tr>
+            <tr><td>Class-D amplifier</td><td>MPN on package</td><td><span class="tag live">High</span></td></tr>
+            <tr><td>USB-C / charger IC</td><td>MPN on package</td><td><span class="tag live">High</span></td></tr>
+            <tr><td>Li-ion cell + BMS</td><td>Cell wrap + IC marking</td><td><span class="tag est">Med</span></td></tr>
+            <tr><td>45 mm driver</td><td>Physical measurement</td><td><span class="tag est">Med</span></td></tr>
+            <tr><td>Passives (R/C/L)</td><td>Package + function infer</td><td><span class="tag est">Med</span></td></tr>
+            <tr><td>Enclosure (3 parts)</td><td>Photogrammetry</td><td><span class="tag est">Med-Low</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 03 ARCHITECTURE ANALYSIS -->
+  <section>
+    <div class="sec-no">03</div>
+    <div class="sec-h">Architecture Analysis</div>
+    <p class="lead">The electronics partition into five functional blocks on a single 4-layer main board,
+    with user controls broken out onto a flex circuit. The architecture is a conventional low-cost integrated
+    BT-audio topology: a single SoC handling the radio, codec and DSP, feeding a discrete Class-D stage, with
+    a separate linear-charging and protection front end for the cell.</p>
+    <div class="arch">
+      <div class="blk"><div class="h">Wireless + DSP</div><div class="b">Beken BK3266 BT 5.1 SoC — integrates radio, Bluetooth Classic/BLE stack, audio codec and DSP. Single-chip approach removes a discrete codec, the primary cost lever in this class.</div></div>
+      <div class="blk"><div class="h">Audio output</div><div class="b">Nsiway NS4165 mono Class-D amplifier, ~3 W into 4 Ω. Filterless output stage driving the 45 mm driver directly.</div></div>
+      <div class="blk"><div class="h">Power &amp; charging</div><div class="b">Injoinic IP2312 USB-C linear charger + DW01A/FS8205 protection (BMS) for the single 18650 cell. No boost converter — SoC and amp run directly from cell voltage.</div></div>
+      <div class="blk"><div class="h">User interface</div><div class="b">Button/LED flex circuit (FPC) with 4 tactile switches and an RGB status LED, ZIF-connected to the main board.</div></div>
+      <div class="blk"><div class="h">Board &amp; interconnect</div><div class="b">70 × 42 mm, 4-layer FR-4, ENIG finish, double-sided SMT. 186 placements, 31 unique parts, 6 through-hole points (cell tabs, driver, USB shell).</div></div>
+    </div>
+    <div class="callout"><strong>Cost-driver insight:</strong> The single-SoC + filterless Class-D topology
+    is what keeps active-silicon cost under ₹250 / unit. A discrete codec + separate MCU design would add an
+    estimated ₹140–190 / unit and a second crystal — confirming this is a cost-optimized reference design.</div>
+  </section>
+
+  <!-- 04 COST BY STAGE -->
+  <section>
+    <div class="sec-no">04</div>
+    <div class="sec-h">Cost by Manufacturing Stage</div>
+    <p class="lead">Per-unit ex-works cost at an order quantity of 1,000 units, decomposed by standard
+    manufacturing stage. Bars are proportional to contribution.</p>
+
+    <div class="stagerow"><div><div class="nm">1 · Component Sourcing (BOM)</div><div class="ds">31 line items · landed, incl. BCD / IGST / freight</div></div><div class="track"><div class="fill" style="width:60%"></div></div><div class="amt">₹747.00</div></div>
+    <div class="stagerow"><div><div class="nm">2 · PCB Fabrication</div><div class="ds">4-layer FR-4, 70×42 mm, ENIG · JLCPCB @ 1,050 pcs</div></div><div class="track"><div class="fill" style="width:7%"></div></div><div class="amt">₹51.00</div></div>
+    <div class="stagerow"><div><div class="nm">3 · PCB Assembly (SMT + THT)</div><div class="ds">186 placements · double-sided · setup amortized</div></div><div class="track"><div class="fill" style="width:18%"></div></div><div class="amt">₹146.00</div></div>
+    <div class="stagerow"><div><div class="nm">4 · Firmware &amp; Programming</div><div class="ds">Flash + fixture time · NRE amortized</div></div><div class="track"><div class="fill" style="width:4%"></div></div><div class="amt">₹32.00</div></div>
+    <div class="stagerow"><div><div class="nm">5 · Enclosure &amp; Mechanical</div><div class="ds">3 moulded parts + grille + tooling amortization</div></div><div class="track"><div class="fill" style="width:22%"></div></div><div class="amt">₹172.00</div></div>
+    <div class="stagerow"><div><div class="nm">6 · Final Assembly, Test &amp; Pack</div><div class="ds">Labour + functional/acoustic test + retail box</div></div><div class="track"><div class="fill" style="width:14%"></div></div><div class="amt">₹95.00</div></div>
+    <div class="stagerow" style="border-bottom:none;margin-top:4px"><div><div class="nm" style="color:var(--brand)">Total ex-works unit cost</div><div class="ds">Before margin, outbound logistics and destination duties</div></div><div></div><div class="amt" style="font-size:15px;color:var(--brand)">₹1,243.00</div></div>
+  </section>
+
+  <!-- 05 BILL OF MATERIALS -->
+  <section>
+    <div class="sec-no">05</div>
+    <div class="sec-h">Bill of Materials</div>
+    <p class="lead">Reconstructed BOM in the platform's standard column format (S.No · MPN · Package ·
+    Description · Qty · Make · Designator), with per-line landed cost. Unit pricing reflects the
+    optimal-vendor selection across distributor APIs at the 1,000-unit break, converted to INR and
+    duty-loaded per HSN classification.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>S.No</th><th>MPN</th><th>Make</th><th>Description</th><th>Desig.</th>
+          <th class="n">Qty</th><th>Pkg</th><th class="n">Unit ₹</th><th class="n">BCD/IGST</th>
+          <th class="n">Ext. ₹</th><th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>BK3266</td><td>Beken</td><td>BT 5.1 audio SoC</td><td>U1</td><td class="n">1</td><td>QFN-48</td><td class="n">152.70</td><td class="n">0% / 18%</td><td class="n">180.20</td><td><span class="tag live">Live</span><span class="src">LCSC</span></td></tr>
+        <tr><td>2</td><td>EVE-18650-26V</td><td>EVE</td><td>Li-ion cell 2,600 mAh</td><td>BT1</td><td class="n">1</td><td>18650</td><td class="n">199.20</td><td class="n">15% / 18%</td><td class="n">270.10</td><td><span class="tag est">Est</span><span class="src">Cell index</span></td></tr>
+        <tr><td>3</td><td>FR-45F-5W</td><td>Generic</td><td>45 mm full-range driver 4Ω 5W</td><td>LS1</td><td class="n">1</td><td>—</td><td class="n">128.70</td><td class="n">10% / 18%</td><td class="n">167.10</td><td><span class="tag est">Est</span><span class="src">Market</span></td></tr>
+        <tr><td>4</td><td>IP2312</td><td>Injoinic</td><td>USB-C linear charger IC</td><td>U3</td><td class="n">1</td><td>ESOP-8</td><td class="n">27.40</td><td class="n">0% / 18%</td><td class="n">32.30</td><td><span class="tag live">Live</span><span class="src">LCSC</span></td></tr>
+        <tr><td>5</td><td>NS4165</td><td>Nsiway</td><td>Class-D mono amplifier</td><td>U2</td><td class="n">1</td><td>ESOP-8</td><td class="n">17.40</td><td class="n">0% / 18%</td><td class="n">20.50</td><td><span class="tag live">Live</span><span class="src">LCSC</span></td></tr>
+        <tr><td>6</td><td>DW01A+FS8205</td><td>—</td><td>BMS protection set</td><td>U4</td><td class="n">1</td><td>SOT-23</td><td class="n">7.50</td><td class="n">0% / 18%</td><td class="n">8.90</td><td><span class="tag live">Live</span><span class="src">Mouser</span></td></tr>
+        <tr><td>7</td><td>TYPE-C-16P</td><td>K. Hroparts</td><td>USB-C receptacle, 16-pin</td><td>J1</td><td class="n">1</td><td>SMD</td><td class="n">9.90</td><td class="n">10% / 18%</td><td class="n">12.90</td><td><span class="tag live">Live</span><span class="src">LCSC</span></td></tr>
+        <tr><td>8</td><td>X322524MOB4SI</td><td>YXC</td><td>24 MHz crystal</td><td>Y1</td><td class="n">1</td><td>3225</td><td class="n">4.90</td><td class="n">0% / 18%</td><td class="n">5.80</td><td><span class="tag live">Live</span><span class="src">LCSC</span></td></tr>
+        <tr><td>9</td><td>SWPA4030S4R7</td><td>Sunlord</td><td>Power inductor 4.7µH 2A</td><td>L1</td><td class="n">1</td><td>4040</td><td class="n">6.60</td><td class="n">10% / 18%</td><td class="n">8.60</td><td><span class="tag live">Live</span><span class="src">Digi-Key</span></td></tr>
+        <tr><td>10</td><td>CL05/CL10 set</td><td>Samsung</td><td>MLCC assortment, 0402/0603</td><td>C1–C18</td><td class="n">18</td><td>0402</td><td class="n">1.00</td><td class="n">0% / 18%</td><td class="n">21.20</td><td><span class="tag est">Est</span><span class="src">Pkg infer</span></td></tr>
+        <tr><td>11</td><td>0402WGF set</td><td>Uni-Royal</td><td>Chip resistor assortment</td><td>R1–R14</td><td class="n">14</td><td>0402</td><td class="n">0.35</td><td class="n">0% / 18%</td><td class="n">5.80</td><td><span class="tag est">Est</span><span class="src">Pkg infer</span></td></tr>
+        <tr><td>12</td><td>FPC-BTN-01</td><td>—</td><td>Button/LED flex + tact + RGB LED</td><td>FPC1</td><td class="n">1</td><td>Assy</td><td class="n">38.10</td><td class="n">10% / 18%</td><td class="n">49.50</td><td><span class="tag est">Est</span><span class="src">—</span></td></tr>
+        <tr><td colspan="11" style="text-align:center;color:var(--muted);font-style:italic;background:#fff">19 additional minor line items (connectors, ESD, ferrites, status LED, MEMS mic) — ₹41.10 total</td></tr>
+      </tbody>
+      <tfoot>
+        <tr><td colspan="9">BOM subtotal — landed (incl. BCD, IGST, freight, 2% scrap)</td><td class="n">₹747.00</td><td></td></tr>
+      </tfoot>
+    </table>
+    <p class="note">Duty is modeled per-MPN from inferred HSN code (active silicon HSN 8542 attracts 0% BCD;
+    cells, drivers and mechanicals carry 10–15% BCD). Battery and driver are priced from market indices rather
+    than a line-item distributor API and are flagged Est.</p>
+  </section>
+
+  <!-- 06 PCB FAB + ASSEMBLY -->
+  <section>
+    <div class="sec-no">06</div>
+    <div class="sec-h">PCB Fabrication &amp; Assembly Detail</div>
+    <p class="lead">The two stages requiring the most rigor, reported separately. Fabrication parameters
+    were auto-extracted from the uploaded Gerber set by the gerber-parser service and quoted live; assembly
+    is modeled on a contract-manufacturer rate card with amortized non-recurring setup.</p>
+    <div class="twocol">
+      <div>
+        <p style="font-weight:700;color:var(--brand-2);margin-bottom:4px">A · PCB Fabrication — JLCPCB API</p>
+        <table class="kv">
+          <tr><td>Base material</td><td>FR-4 TG150</td></tr>
+          <tr><td>Layers</td><td>4</td></tr>
+          <tr><td>Dimensions</td><td>70 × 42 mm (29.4 cm²)</td></tr>
+          <tr><td>Thickness</td><td>1.6 mm</td></tr>
+          <tr><td>Surface finish</td><td>ENIG</td></tr>
+          <tr><td>Copper weight</td><td>1 oz outer / 0.5 oz inner</td></tr>
+          <tr><td>Min trace / space</td><td>5 / 5 mil</td></tr>
+          <tr><td>Panelization</td><td>5-up, 1,050 pcs</td></tr>
+          <tr><td>Lead time</td><td>5–7 days</td></tr>
+          <tr style="font-weight:700"><td>Fab cost / board</td><td>₹51.00</td></tr>
+        </table>
+      </div>
+      <div>
+        <p style="font-weight:700;color:var(--brand-2);margin-bottom:4px">B · PCB Assembly — SMT + THT</p>
+        <table class="kv">
+          <tr><td>SMD placements</td><td>186</td></tr>
+          <tr><td>Unique parts</td><td>31</td></tr>
+          <tr><td>Sides</td><td>Double-sided</td></tr>
+          <tr><td>THT points</td><td>6 (wave / hand)</td></tr>
+          <tr><td>Stencil (NRE)</td><td>₹2,100 → amortized</td></tr>
+          <tr><td>Feeder / line setup (NRE)</td><td>₹96,000 → amortized</td></tr>
+          <tr><td>SMT placement rate</td><td>₹0.71 / joint</td></tr>
+          <tr><td>Paste + reflow</td><td>₹17.40 / board</td></tr>
+          <tr><td>THT + AOI inspection</td><td>₹15.10 / board</td></tr>
+          <tr style="font-weight:700"><td>Assembly / board @ 1k</td><td>₹146.00</td></tr>
+        </table>
+      </div>
+    </div>
+    <p class="note">Placement count is derived from the BOM and pick-and-place file. The per-joint rate and
+    setup NRE come from a configurable CM rate card; the values shown model a Tier-2 Indian EMS provider.</p>
+  </section>
+
+  <!-- 07 COST vs VOLUME -->
+  <section>
+    <div class="sec-no">07</div>
+    <div class="sec-h">Cost vs. Volume</div>
+    <p class="lead">Per-unit ex-works cost across order quantities. NRE-heavy stages (assembly, enclosure,
+    firmware) collapse as volume rises; the BOM floor is set by component price breaks.</p>
+    <table>
+      <thead><tr><th>Stage</th><th class="n">1 unit</th><th class="n">100</th><th class="n">1,000</th><th class="n">10,000</th></tr></thead>
+      <tbody>
+        <tr><td>Component BOM (landed)</td><td class="n">1,628.00</td><td class="n">940.00</td><td class="n">747.00</td><td class="n">659.00</td></tr>
+        <tr><td>PCB fabrication</td><td class="n">1,008.00</td><td class="n">122.00</td><td class="n">51.00</td><td class="n">35.00</td></tr>
+        <tr><td>PCB assembly</td><td class="n">4,030.00</td><td class="n">411.00</td><td class="n">146.00</td><td class="n">99.00</td></tr>
+        <tr><td>Firmware / programming</td><td class="n">176.00</td><td class="n">60.00</td><td class="n">32.00</td><td class="n">18.00</td></tr>
+        <tr><td>Enclosure &amp; mechanical*</td><td class="n">20,160.00</td><td class="n">445.00</td><td class="n">172.00</td><td class="n">119.00</td></tr>
+        <tr><td>Final assembly, test, pack</td><td class="n">546.00</td><td class="n">160.00</td><td class="n">95.00</td><td class="n">71.00</td></tr>
+      </tbody>
+      <tfoot>
+        <tr><td>Total ex-works / unit</td><td class="n">₹27,548.00</td><td class="n">₹2,138.00</td><td class="n">₹1,243.00</td><td class="n">₹1,001.00</td></tr>
+      </tfoot>
+    </table>
+    <p class="note">*At quantity 1, the enclosure is CNC/3D-printed prototype, not injection-moulded — the
+    ₹11,90,000 tool is not amortizable, so a prototype proxy cost is shown. The curve assumes tooling fully
+    written off by 10,000 units.</p>
+  </section>
+
+  <!-- 08 MARKET CONTEXT -->
+  <section>
+    <div class="sec-no">08</div>
+    <div class="sec-h">Market Context</div>
+    <p class="lead">Positioning the reconstructed cost against the comparable retail tier and supply landscape,
+    to frame margin headroom and sourcing risk.</p>
+    <div class="twocol">
+      <div>
+        <p style="font-weight:600;margin-bottom:4px">Comparable units &amp; margin band</p>
+        <table>
+          <thead><tr><th>Comparable</th><th class="n">Retail MRP</th><th class="n">Est. landed</th><th class="n">Implied GM</th></tr></thead>
+          <tbody>
+            <tr><td>This unit @ 10k</td><td class="n">₹2,499</td><td class="n">₹1,001</td><td class="n">60%</td></tr>
+            <tr><td>Tier-1 brand equiv.</td><td class="n">₹2,999</td><td class="n">≈₹1,250</td><td class="n">58%</td></tr>
+            <tr><td>White-label equiv.</td><td class="n">₹1,799</td><td class="n">≈₹980</td><td class="n">46%</td></tr>
+          </tbody>
+        </table>
+        <p class="note">Margin is gross (MRP less landed ex-works), before distribution, GST output, marketing
+        and returns. Comparable landed costs are modeled, not audited.</p>
+      </div>
+      <div>
+        <p style="font-weight:600;margin-bottom:4px">Sourcing &amp; supply observations</p>
+        <ul class="tight">
+          <li><strong>Concentration risk:</strong> SoC, amp and charger are single-sourced from Chinese
+          fabless vendors (Beken, Nsiway, Injoinic) — all available via LCSC, but with limited Western
+          distribution. A second-source plan is advisable above 10k volume.</li>
+          <li><strong>Duty exposure:</strong> Active silicon enters at 0% BCD, but the cell (15%) and driver
+          (10%) drive the duty load. Domestic cell sourcing could remove ~₹35 / unit.</li>
+          <li><strong>Price volatility:</strong> The 18650 cell is the most volatile line — lithium spot
+          movement of ±15% shifts unit cost by ~₹40. Pricing is timestamped at generation.</li>
+          <li><strong>Lead time:</strong> Longest-lead item is the BT SoC at 8–10 weeks; all others &lt; 4 weeks.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 09 METHODOLOGY -->
+  <section style="border-bottom:none">
+    <div class="sec-no">09</div>
+    <div class="sec-h">Methodology &amp; Confidence</div>
+    <table>
+      <thead><tr><th>Stage</th><th>Data source</th><th>Method</th><th>Confidence</th></tr></thead>
+      <tbody>
+        <tr><td>Component identification</td><td>Teardown photos + spec PDF</td><td>Vision MPN read, silkscreen OCR, parametric match</td><td><span class="tag live">High</span></td></tr>
+        <tr><td>Component pricing</td><td>Digi-Key, Mouser, LCSC, Arrow APIs</td><td>Live qty-break lookup, optimal-vendor selection</td><td><span class="tag live">High</span></td></tr>
+        <tr><td>Landed / customs</td><td>HSN classifier</td><td>Per-MPN HSN → BCD / SWS / IGST</td><td><span class="tag est">Medium</span></td></tr>
+        <tr><td>PCB fabrication</td><td>Gerber parser + JLCPCB API</td><td>Auto-extracted params → live quote</td><td><span class="tag live">High</span></td></tr>
+        <tr><td>PCB assembly</td><td>BOM + P&amp;P + CM rate card</td><td>Per-joint model + amortized NRE</td><td><span class="tag est">Medium</span></td></tr>
+        <tr><td>Enclosure</td><td>Photogrammetry + resin DB</td><td>Volume × material + tooling model</td><td><span class="tag est">Med-Low</span></td></tr>
+        <tr><td>Battery / driver</td><td>Market index</td><td>Comparable-part proxy</td><td><span class="tag est">Low-Med</span></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    Generated by the Elecbits Teardown Cost Engine on 19 Jun 2026. Figures are estimates for internal
+    planning and carry the confidence bands stated in Section 09. Live distributor pricing and FX are
+    timestamped at generation and will drift over time. All amounts are landed ex-works in Indian Rupees (₹)
+    unless otherwise noted. This document is not a vendor quotation and does not constitute a commercial offer.
+  </footer>
+
+</div>
+</body>
+</html>

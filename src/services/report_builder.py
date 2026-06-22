@@ -34,21 +34,25 @@ _ASSESS_PROMPT = """You are preparing a professional electronics should-cost rep
 Below is everything currently known about the product (a prose theory summary and a structured JSON breakdown), \
 plus the user's request.
 
+This is a SINGLE-UNIT cost report — do NOT ask about production volume, order quantity, or annual demand; \
+those are irrelevant here.
+
 Decide whether there is ENOUGH information to produce a credible should-cost report, or whether a SMALL number of \
-targeted questions to the user would materially improve it. Only ask about MATERIAL unknowns that move the cost or \
-are required for the report structure, for example:
-- The intended production volume (units) — needed for pricing, if not already stated.
-- An expensive/unidentified IC whose marking is illegible (ask the user to read it or upload a clearer photo).
-- PCB layer count, board dimensions, or enclosure material/process when missing and needed for fab/assembly/enclosure costing.
+targeted questions to the user would materially improve it. Only ask about MATERIAL physical unknowns that move the \
+per-unit cost and that the user can actually answer from the product in hand, for example:
+- An expensive or unidentified IC whose marking is illegible (ask the user to read the top-mark or upload a clearer photo).
+- PCB layer count or board dimensions, when missing and needed for fab costing.
+- Enclosure material or manufacturing process, when missing and needed for tooling/enclosure costing.
 
 Rules:
 - Ask AT MOST {max_questions} questions. Fewer is better. If the data is already sufficient, return an empty list.
-- Never ask for Gerbers, CAD, schematics, or firmware — only things a teardown/photo/measurement can provide.
+- Never ask for Gerbers, CAD, schematics, firmware, or production volume — only physical things a teardown/photo/measurement can provide.
 - Each question may request a short text answer (kind "text") or ask the user to upload a file/photo (kind "file").
+- Give each question a short, stable, descriptive "id" (e.g. "ic_u3_marking", "pcb_layers", "enclosure_material").
 - Mark a question optional when the report can still be produced without it.
 
 Return ONLY a JSON object of this exact shape, nothing else:
-{{"questions": [{{"id": "volume", "prompt": "...", "kind": "text", "optional": false, "why": "..."}}]}}
+{{"questions": [{{"id": "pcb_layers", "prompt": "...", "kind": "text", "optional": true, "why": "..."}}]}}
 
 USER REQUEST:
 {user_request}
