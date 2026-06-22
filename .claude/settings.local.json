@@ -23,7 +23,9 @@
       "Bash(rm -rf logs)",
       "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.services.report_template, src.routers.reports, src.agent.tools.report_tool; print\\('imports OK'\\)\")",
       "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main; print\\('app imports OK'\\)\")",
-      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool, src.services.report_template, src.services.report_pipeline; print\\('backend imports OK'\\)\")"
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool, src.services.report_template, src.services.report_pipeline; print\\('backend imports OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool, src.services.report_qa_ingest, src.services.report_builder; print\\('OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool; print\\('backend imports OK'\\)\")"
     ]
   }
 }

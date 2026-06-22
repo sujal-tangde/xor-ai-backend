@@ -40,6 +40,25 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "report_generation"
 TOOL_LABEL = "report generation"
 
+# HILT is implemented with LangGraph ``interrupt()``, which re-runs the whole tool
+# from the top on resume — so ``assess_missing`` (an LLM call) would run twice and
+# could return DIFFERENT questions the second time, breaking the answer↔question
+# matching. We cache the first assessment per thread_id (stable across a turn and
+# its resume) so the resume reuses the exact same questions. Cleared on completion.
+_ASSESS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_ASSESS_CACHE_MAX = 256
+
+
+def _assess_questions(thread_id: str | None, theory: str, structured: dict, request: str) -> list:
+    if thread_id and thread_id in _ASSESS_CACHE:
+        return _ASSESS_CACHE[thread_id]
+    questions = report_builder.assess_missing(theory, structured, request)
+    if thread_id:
+        if len(_ASSESS_CACHE) >= _ASSESS_CACHE_MAX:
+            _ASSESS_CACHE.clear()
+        _ASSESS_CACHE[thread_id] = questions
+    return questions
+
 # Cumulative (start, end) progress fraction per stage for the overall bar. The
 # tool computes the emitted ``progress`` from this table so the pipeline only has
 # to name the stage + status (+ optional meta for interpolation within a stage).
@@ -151,6 +170,67 @@ def _normalize_answer(raw: Any) -> dict[str, Any]:
         text = raw.strip()
         return {"answer": text, "file_ids": None, "status": "answered" if text else "skipped"}
     return {"answer": "", "file_ids": None, "status": "skipped"}
+
+
+def _merge_qa_into_product(
+    structured: dict[str, Any],
+    theory: str,
+    qa_pairs: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    """Fold HILT answers into THIS report's data (not just the async KB).
+
+    Additive only — it can fill/sharpen fields (pcb layers, dimensions, enclosure
+    material/process, a confirmed IC marking/MPN) and append new components, but
+    never drops anything already known. Returns the enriched (structured, theory).
+    """
+    from src.services import report_qa_ingest
+
+    qa_theory, patch = report_qa_ingest.extract_qa_facts(qa_pairs)
+    if not qa_theory and not patch:
+        return structured, theory
+
+    merged = dict(structured)
+    if isinstance(patch, dict):
+        # Shallow-fill dict sections (only set fields that are currently empty/missing).
+        for section in ("product", "pcb", "enclosure"):
+            incoming = patch.get(section)
+            if isinstance(incoming, dict):
+                base = dict(merged.get(section) or {})
+                for k, v in incoming.items():
+                    if v in (None, "", []):
+                        continue
+                    if base.get(k) in (None, "", [], {}):
+                        base[k] = v
+                merged[section] = base
+
+        # Append any components the answers revealed (match by ref_des to update mpn/top_mark).
+        incoming_components = patch.get("components")
+        if isinstance(incoming_components, list) and incoming_components:
+            existing = list(merged.get("components") or [])
+            by_ref = {
+                str(c.get("ref_des")).lower(): c
+                for c in existing
+                if isinstance(c, dict) and c.get("ref_des")
+            }
+            for comp in incoming_components:
+                if not isinstance(comp, dict):
+                    continue
+                ref = str(comp.get("ref_des") or "").lower()
+                target = by_ref.get(ref)
+                if target is not None:
+                    for k in ("mpn", "top_mark", "value", "manufacturer", "package"):
+                        if comp.get(k) and not target.get(k):
+                            target[k] = comp[k]
+                else:
+                    existing.append(comp)
+            merged["components"] = existing
+
+        # Carry assumptions through.
+        if isinstance(patch.get("assumptions"), list) and patch["assumptions"]:
+            merged["assumptions"] = list(merged.get("assumptions") or []) + patch["assumptions"]
+
+    new_theory = (theory + "\n\n" + qa_theory).strip() if qa_theory else theory
+    return merged, new_theory
 
 
 def _structured_from_kb(kb: dict[str, Any]) -> dict[str, Any]:
@@ -316,6 +396,7 @@ def report_generation_tool(
     project_id = cfg.get("project_id")
     user_id = cfg.get("user_id")
     conversation_id = cfg.get("conversation_id")
+    thread_id = cfg.get("thread_id")
 
     if not project_id:
         return "No project is associated with this conversation, so I can't build a report."
@@ -347,7 +428,8 @@ def report_generation_tool(
 
     # ---- Step 2: HILT gap questions ----------------------------------------- #
     emit("hilt", "started", "Checking whether I need any details from you…")
-    questions = report_builder.assess_missing(theory, structured, request)
+    # Cached per thread_id so the resume re-run yields the SAME questions.
+    questions = _assess_questions(thread_id, theory, structured, request)
     answers_by_id: dict[str, dict[str, Any]] = {}
     if questions:
         from langgraph.types import interrupt
@@ -372,11 +454,23 @@ def report_generation_tool(
             except Exception:
                 logger.warning("Failed to persist report question", exc_info=True)
             qa_pairs.append({"question": q["prompt"], "answer": ans["answer"], "file_ids": ans["file_ids"]})
+
+        # Fold the answers into THIS report run (sharpen MPNs/specs), then queue
+        # the same facts for the async KB recompute so future reports benefit too.
+        if any(p.get("answer") or p.get("file_ids") for p in qa_pairs):
+            try:
+                structured, theory = _merge_qa_into_product(structured, theory, qa_pairs)
+                product_label = ((structured.get("product") or {}).get("name")) or product_label
+            except Exception:
+                logger.warning("Failed to fold Q&A answers into the report", exc_info=True)
         try:
             enqueue_qa_insight(str(project_id), user_id, qa_pairs)
         except Exception:
             logger.warning("Failed to enqueue Q&A insight ingestion", exc_info=True)
-    emit("hilt", "done", "Got what I need.")
+    # Resume consumed the cached assessment — release it.
+    if thread_id:
+        _ASSESS_CACHE.pop(thread_id, None)
+    emit("hilt", "done", "Thanks — using your details." if questions else "No extra details needed.")
 
     # ---- Determine production volume ---------------------------------------- #
     # The report is always for a SINGLE unit. We do not parse a production volume
