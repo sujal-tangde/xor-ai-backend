@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
 from src.core.auth import get_current_user
-from src.services import currency, reports as reports_service
+from src.services import reports as reports_service
 
 router = APIRouter(tags=["reports"])
 
@@ -19,43 +19,35 @@ def _safe_filename(title: str | None) -> str:
 
 @router.get("/{report_id}")
 async def get_report(report_id: str, user=Depends(get_current_user)):
-    """Return report metadata + markdown (no PDF bytes) for preview."""
+    """Return report metadata + rendered HTML + structured JSON for preview."""
     record = reports_service.get_report(report_id, user["id"])
     if record is None:
         raise HTTPException(status_code=404, detail="Report not found")
-    markdown = reports_service.normalize_report_markdown(record.get("markdown") or "")
-    costs = currency.costs_for_display(record.get("costs"))
-    if costs.get("currency") == "INR":
-        markdown = currency.enforce_inr_markdown(markdown, costs)
+    report_json = record.get("report_json") or {}
     return {
         "id": record["id"],
         "title": record.get("title"),
-        "markdown": markdown,
         "volume": record.get("volume"),
-        "costs": costs,
+        "html": record.get("html"),
+        "report_json": report_json,
+        "pdf_url": record.get("pdf_url"),
         "status": record.get("status"),
         "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),
+        # Legacy markdown reports (pre-migration) still render in the panel.
+        "markdown": reports_service.normalize_report_markdown(record.get("markdown") or "")
+        if record.get("markdown")
+        else None,
     }
 
 
 @router.get("/{report_id}/download")
 async def download_report(report_id: str, user=Depends(get_current_user)):
-    """Stream the report PDF as an attachment."""
+    """Stream the report PDF as an attachment (from the bucket, else re-rendered)."""
     record = reports_service.get_report(report_id, user["id"])
     if record is None:
         raise HTTPException(status_code=404, detail="Report not found")
-    markdown = reports_service.normalize_report_markdown(record.get("markdown") or "")
-    costs = currency.costs_for_display(record.get("costs"))
-    if costs.get("currency") == "INR":
-        markdown = currency.enforce_inr_markdown(markdown, costs)
-    if markdown:
-        subtitle = currency.report_subtitle(record.get("volume"), costs)
-        pdf_bytes = reports_service.render_pdf(
-            markdown, title=record.get("title"), subtitle=subtitle
-        )
-    else:
-        pdf_bytes = reports_service.get_report_pdf_bytes(report_id, user["id"])
+    pdf_bytes = reports_service.get_report_pdf_bytes(report_id, user["id"])
     if not pdf_bytes:
         raise HTTPException(status_code=404, detail="Report PDF not available")
     filename = _safe_filename(record.get("title"))

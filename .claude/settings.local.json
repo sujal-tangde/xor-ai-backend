@@ -14,7 +14,11 @@
       "Bash(./venv/Scripts/python.exe -)",
       "Bash(./venv/Scripts/python.exe -m pip install xhtml2pdf markdown)",
       "Bash(./venv/Scripts/python.exe -c \"import importlib; [print\\(m, 'OK'\\) for m in ['httpx','requests'] if importlib.util.find_spec\\(m\\)]\")",
-      "Bash(./venv/Scripts/python.exe -c \"import importlib.util as u; print\\('httpx', bool\\(u.find_spec\\('httpx'\\)\\)\\); print\\('requests', bool\\(u.find_spec\\('requests'\\)\\)\\)\")"
+      "Bash(./venv/Scripts/python.exe -c \"import importlib.util as u; print\\('httpx', bool\\(u.find_spec\\('httpx'\\)\\)\\); print\\('requests', bool\\(u.find_spec\\('requests'\\)\\)\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c ' *)",
+      "Bash(./venv/Scripts/python.exe -m pip install playwright -q)",
+      "Bash(./venv/Scripts/python.exe -m playwright install chromium)",
+      "Bash(rm -f test_render.html test_render.pdf)"
     ]
   }
 }

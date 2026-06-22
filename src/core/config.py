@@ -66,10 +66,63 @@ REPORT_DEFAULT_VOLUME = int(
 REPORT_MAX_QUESTIONS = int(
     (os.getenv("REPORT_MAX_QUESTIONS", "4").strip().strip('"').strip("'")) or "4"
 )
-# Fallback USD→INR rate when Tavily is unavailable or cannot parse a spot rate.
+# Fallback USD→INR rate when the FX API is unavailable.
 REPORT_USD_INR_FALLBACK = float(
     (os.getenv("REPORT_USD_INR_FALLBACK", "85.0").strip().strip('"').strip("'")) or "85.0"
 )
+
+# The four order quantities the entire cost model is run at (the volume curve).
+REPORT_VOLUME_CURVE = [
+    int(x)
+    for x in (
+        os.getenv("REPORT_VOLUME_CURVE", "1,100,1000,10000")
+        .strip()
+        .strip('"')
+        .strip("'")
+        .split(",")
+    )
+    if x.strip()
+] or [1, 100, 1000, 10000]
+
+# --------------------------------------------------------------------------- #
+# Component pricing — Mouser (INR list prices for the BOM).
+# --------------------------------------------------------------------------- #
+MOUSER_API_KEY = os.getenv("MOUSER_API_KEY", "").strip().strip('"').strip("'")
+MOUSER_API_BASE = os.getenv(
+    "MOUSER_API_BASE", "https://api.mouser.com/api/v2"
+).strip().strip('"').strip("'")
+
+# --------------------------------------------------------------------------- #
+# PCB fabrication quote — PCBWay (USD prices, converted to INR via Frankfurter).
+# --------------------------------------------------------------------------- #
+PCBWAY_API_KEY = os.getenv("PCBWAY_API_KEY", "").strip().strip('"').strip("'")
+PCBWAY_API_BASE = os.getenv(
+    "PCBWAY_API_BASE", "https://api-partner.pcbway.com"
+).strip().strip('"').strip("'")
+
+# --------------------------------------------------------------------------- #
+# FX — Frankfurter (no key). Used ONLY to convert the PCBWay USD quote to INR.
+# --------------------------------------------------------------------------- #
+FRANKFURTER_API_BASE = os.getenv(
+    "FRANKFURTER_API_BASE", "https://api.frankfurter.dev/v1"
+).strip().strip('"').strip("'")
+
+# --------------------------------------------------------------------------- #
+# Assembly model — Indian EMS rate card (no API). Stencil + setup are one-time
+# NRE; the per-joint rate is per-unit. All INR.
+# --------------------------------------------------------------------------- #
+ASSEMBLY_SETUP_FEE_INR = float(
+    (os.getenv("ASSEMBLY_SETUP_FEE_INR", "1000.0").strip().strip('"').strip("'")) or "1000.0"
+)
+ASSEMBLY_STENCIL_FEE_INR = float(
+    (os.getenv("ASSEMBLY_STENCIL_FEE_INR", "500.0").strip().strip('"').strip("'")) or "500.0"
+)
+ASSEMBLY_RATE_PER_JOINT_INR = float(
+    (os.getenv("ASSEMBLY_RATE_PER_JOINT_INR", "0.15").strip().strip('"').strip("'")) or "0.15"
+)
+
+# Supabase storage bucket for rendered report PDFs (path/URL stored, not base64).
+REPORTS_BUCKET = os.getenv("REPORTS_BUCKET", "reports").strip().strip('"').strip("'")
 
 # Supabase (storage + Postgres metadata for uploads).
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")
