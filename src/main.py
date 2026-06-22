@@ -14,6 +14,12 @@ app = FastAPI(title=APP_NAME)
 @app.on_event("startup")
 async def on_startup() -> None:
     ensure_schema()
+    try:
+        from src.services.reports import ensure_reports_bucket
+
+        await asyncio.to_thread(ensure_reports_bucket)
+    except Exception:
+        pass
     await asyncio.to_thread(get_agent)
 
 # Allow the frontend to connect (tighten allow_origins for production).

@@ -1,19 +1,21 @@
 """The ``report_generation`` agent tool.
 
-Generates a professional should-cost PDF report for a project. It:
+Generates (or edits) a professional should-cost PDF report for a project. It:
 
-1. Pulls the project knowledge base (theory + structured context).
-2. Uses HILT (``interrupt()``) to ask the user a SMALL number of clarifying
-   questions when the data is insufficient — the user can answer, skip, or
-   upload a file. Answered questions are persisted and folded back into the
-   insight pipeline in the background.
-3. Resolves + prices the BOM via the DigiKey API.
-4. Optionally pulls extra product/market context from Tavily web search.
-5. Composes the report markdown, renders it to PDF, stores it, and streams the
-   result to the frontend (right-side preview + download).
+1.  Reads the project knowledge base (vision-derived components/pcb/enclosure/…).
+2.  Uses HILT (``interrupt()``) to ask a SMALL number of clarifying questions
+    when material data is missing; answers are persisted + folded back into KB.
+3.  Resolves MPNs, then in parallel prices the BOM (Mouser), quotes the PCB
+    (PCBWay), estimates non-quotable blocks, and gathers market context (Tavily).
+4.  Applies FX (PCBWay only), customs duty, the assembly model and the volume
+    curve, aggregates one structured JSON, fills the locked HTML template,
+    renders a PDF, uploads it to the ``reports`` bucket, and streams the result.
 
-Progress is streamed to the UI via the LangGraph custom stream channel; the
-question round is delivered via the graph interrupt mechanism.
+Every stage emits a ``report_progress`` event (start → done/warning) and degrades
+gracefully — the report always generates; any gap is disclosed in plain language.
+
+The governing principle: **the LLM narrates, the code computes.** All numbers are
+computed in code with a ``Live``/``Est`` source tag; nothing is hallucinated.
 """
 
 from __future__ import annotations
@@ -28,7 +30,8 @@ from langchain_core.tools import tool
 
 from src.agent.tools.validation import invalid_project_id_message, is_uuid
 from src.core.config import REPORT_DEFAULT_VOLUME
-from src.services import currency, report_builder, reports
+from src.services import report_builder, report_edit, report_pipeline, report_template, reports
+from src.services.failure_log import record_failure
 from src.services.projects_service import get_project_knowledge_base, get_project_name
 from src.services.queue import enqueue_qa_insight
 
@@ -37,37 +40,47 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "report_generation"
 TOOL_LABEL = "report generation"
 
-# The report structure/prompt. {volume} is substituted at composition time.
-REPORT_PROMPT = """You are generating a professional electronics should-cost analysis report in clean GitHub-flavored Markdown.
+# HILT is implemented with LangGraph ``interrupt()``, which re-runs the whole tool
+# from the top on resume — so ``assess_missing`` (an LLM call) would run twice and
+# could return DIFFERENT questions the second time, breaking the answer↔question
+# matching. We cache the first assessment per thread_id (stable across a turn and
+# its resume) so the resume reuses the exact same questions. Cleared on completion.
+_ASSESS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_ASSESS_CACHE_MAX = 256
 
-Use EXACTLY these top-level sections (## headings), in this order:
-1. Executive Summary
-2. Product Overview
-3. Architecture Analysis
-4. BOM
-5. Fab Costing
-6. Assembly
-7. Enclosure and Total Should-Cost for {volume} units
-8. Market Context
-9. Design Observations
-10. Citations
 
-Section requirements:
-- Executive Summary: 2-4 sentences on what the product is, then paste the PRE-COMPUTED executive summary table verbatim (see below). Do NOT create your own cost table.
-- BOM: Paste the PRE-COMPUTED BOM table verbatim, then list `costs.bom.notes` if any. Do NOT build your own BOM pricing table.
-- Fab Costing / Assembly / Enclosure: use the PRE-COMPUTED INR figures provided below; add brief narrative citing `dimensions`, `materials`, `enclosure` facts where relevant.
-- Total should-cost: use the PRE-COMPUTED total figure provided below.
+def _assess_questions(thread_id: str | None, theory: str, structured: dict, request: str) -> list:
+    if thread_id and thread_id in _ASSESS_CACHE:
+        return _ASSESS_CACHE[thread_id]
+    questions = report_builder.assess_missing(theory, structured, request)
+    if thread_id:
+        if len(_ASSESS_CACHE) >= _ASSESS_CACHE_MAX:
+            _ASSESS_CACHE.clear()
+        _ASSESS_CACHE[thread_id] = questions
+    return questions
 
-Rules:
-- NEVER use USD. All monetary values are INR only. The `costs` object has `currency: "INR"`.
-- Use ONLY the pre-computed tables and INR numbers provided — never invent figures.
-- Format money with the ₹ symbol (e.g. ₹300.48).
-- In Citations, cite DigiKey, the USD→INR rate from `costs.fx`, and uploaded documents.
-- Note assumptions honestly. BOM DigiKey prices were converted using `costs.fx.usd_inr`."""
+# Cumulative (start, end) progress fraction per stage for the overall bar. The
+# tool computes the emitted ``progress`` from this table so the pipeline only has
+# to name the stage + status (+ optional meta for interpolation within a stage).
+_STAGE_RANGE: dict[str, tuple[float, float]] = {
+    "reading_kb": (0.00, 0.04),
+    "hilt": (0.04, 0.08),
+    "resolving_mpns": (0.08, 0.20),
+    "pricing": (0.20, 0.45),
+    "fab_quote": (0.45, 0.50),
+    "non_quotable": (0.50, 0.55),
+    "market_context": (0.55, 0.62),
+    "fx": (0.62, 0.66),
+    "duty": (0.66, 0.74),
+    "assembly": (0.74, 0.80),
+    "volume_curve": (0.80, 0.88),
+    "rendering": (0.88, 0.94),
+    "storing": (0.94, 0.99),
+    "report_ready": (1.0, 1.0),
+}
 
 
 def _writer():
-    """Return the LangGraph custom-stream writer, or a noop if unavailable."""
     try:
         from langgraph.config import get_stream_writer
 
@@ -76,11 +89,39 @@ def _writer():
         return lambda _payload: None
 
 
-def _emit(stage: str, message: str) -> None:
-    try:
-        _writer()({"kind": "report_progress", "stage": stage, "message": message})
-    except Exception:  # pragma: no cover - streaming best-effort
-        pass
+def _make_emit():
+    """Capture the stream writer once (in the node context) and return an emit fn.
+
+    The returned ``emit`` is safe to call from worker threads (it closes over the
+    captured writer rather than re-reading a contextvar that wouldn't propagate).
+    """
+    writer = _writer()
+
+    def emit(stage: str, status: str, message: str, meta: dict[str, Any] | None = None) -> None:
+        start, end = _STAGE_RANGE.get(stage, (0.0, 1.0))
+        if status == "in_progress" and meta and meta.get("total"):
+            try:
+                frac = float(meta["current"]) / float(meta["total"])
+            except (TypeError, ValueError, ZeroDivisionError):
+                frac = 0.0
+            progress = round(start + (end - start) * max(0.0, min(1.0, frac)), 3)
+        elif status in ("started",):
+            progress = round(start, 3)
+        else:  # done | warning | error
+            progress = round(end, 3)
+        try:
+            writer({
+                "kind": "report_progress",
+                "stage": stage,
+                "status": status,
+                "message": message,
+                "progress": progress,
+                "meta": meta or {},
+            })
+        except Exception:  # pragma: no cover - streaming best-effort
+            pass
+
+    return emit, writer
 
 
 def _cfg(config: RunnableConfig | None) -> dict[str, Any]:
@@ -88,23 +129,38 @@ def _cfg(config: RunnableConfig | None) -> dict[str, Any]:
 
 
 def _parse_volume(text: str) -> int | None:
-    """Pull a production volume from free text like '10k units' / 'volume 5000'."""
+    """Pull a production volume ONLY when the user states it explicitly.
+
+    Requires an explicit quantity context — a unit word, a 'k' suffix, or a
+    'volume/qty of N' phrase — so a stray number in the message (e.g. "9") is
+    never mistaken for a production volume. Otherwise returns None (the caller
+    defaults to a per-unit basis).
+    """
     if not text:
         return None
-    match = re.search(r"(\d[\d,\.]*)\s*([kK])?\s*(?:units|pcs|pieces|qty|volume)?", text)
-    if not match:
-        return None
-    try:
-        value = float(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
-    if match.group(2):
-        value *= 1000
-    return int(value) if value > 0 else None
+    patterns = (
+        r"(\d[\d,\.]*)\s*([kK])\b",  # "10k"
+        r"(\d[\d,\.]*)\s*(?:units?|pcs|pieces|qty|quantity)\b",  # "5000 units"
+        r"(?:volume|qty|quantity)\s*(?:of|=|:|is)?\s*(\d[\d,\.]*)\s*([kK])?",  # "volume of 5000"
+        r"\bfor\s+(\d[\d,\.]*)\s*([kK])?\s*(?:units?|pcs|pieces)\b",  # "for 1000 units"
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except (ValueError, IndexError):
+            continue
+        groups = match.groups()
+        if len(groups) > 1 and groups[1] and groups[1].lower() == "k":
+            value *= 1000
+        if value > 0:
+            return int(value)
+    return None
 
 
 def _normalize_answer(raw: Any) -> dict[str, Any]:
-    """Coerce one resumed answer into {answer, file_ids, status}."""
     if isinstance(raw, dict):
         answer = (raw.get("answer") or "").strip() if raw.get("answer") else ""
         file_ids = raw.get("file_ids") or None
@@ -116,24 +172,158 @@ def _normalize_answer(raw: Any) -> dict[str, Any]:
     return {"answer": "", "file_ids": None, "status": "skipped"}
 
 
-def _tavily_context(query: str) -> str | None:
-    """Best-effort web context for the report (returns a compact string)."""
-    try:
-        from src.agent.tools.tavily_search_tool import get_tavily_search_tool
+def _merge_qa_into_product(
+    structured: dict[str, Any],
+    theory: str,
+    qa_pairs: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    """Fold HILT answers into THIS report's data (not just the async KB).
 
-        tool_obj = get_tavily_search_tool()
-        if tool_obj is None:
-            return None
-        result = tool_obj.invoke({"query": query})
-        if isinstance(result, dict):
-            answer = result.get("answer")
-            if answer:
-                return str(answer)
-            return json.dumps(result, ensure_ascii=False)[:4000]
-        return str(result)[:4000]
-    except Exception:
-        logger.warning("Tavily context fetch failed", exc_info=True)
-        return None
+    Additive only — it can fill/sharpen fields (pcb layers, dimensions, enclosure
+    material/process, a confirmed IC marking/MPN) and append new components, but
+    never drops anything already known. Returns the enriched (structured, theory).
+    """
+    from src.services import report_qa_ingest
+
+    qa_theory, patch = report_qa_ingest.extract_qa_facts(qa_pairs)
+    if not qa_theory and not patch:
+        return structured, theory
+
+    merged = dict(structured)
+    if isinstance(patch, dict):
+        # Shallow-fill dict sections (only set fields that are currently empty/missing).
+        for section in ("product", "pcb", "enclosure"):
+            incoming = patch.get(section)
+            if isinstance(incoming, dict):
+                base = dict(merged.get(section) or {})
+                for k, v in incoming.items():
+                    if v in (None, "", []):
+                        continue
+                    if base.get(k) in (None, "", [], {}):
+                        base[k] = v
+                merged[section] = base
+
+        # Append any components the answers revealed (match by ref_des to update mpn/top_mark).
+        incoming_components = patch.get("components")
+        if isinstance(incoming_components, list) and incoming_components:
+            existing = list(merged.get("components") or [])
+            by_ref = {
+                str(c.get("ref_des")).lower(): c
+                for c in existing
+                if isinstance(c, dict) and c.get("ref_des")
+            }
+            for comp in incoming_components:
+                if not isinstance(comp, dict):
+                    continue
+                ref = str(comp.get("ref_des") or "").lower()
+                target = by_ref.get(ref)
+                if target is not None:
+                    for k in ("mpn", "top_mark", "value", "manufacturer", "package"):
+                        if comp.get(k) and not target.get(k):
+                            target[k] = comp[k]
+                else:
+                    existing.append(comp)
+            merged["components"] = existing
+
+        # Carry assumptions through.
+        if isinstance(patch.get("assumptions"), list) and patch["assumptions"]:
+            merged["assumptions"] = list(merged.get("assumptions") or []) + patch["assumptions"]
+
+    new_theory = (theory + "\n\n" + qa_theory).strip() if qa_theory else theory
+    return merged, new_theory
+
+
+def _structured_from_kb(kb: dict[str, Any]) -> dict[str, Any]:
+    structured = kb.get("structured_context")
+    if isinstance(structured, str):
+        try:
+            structured = json.loads(structured)
+        except json.JSONDecodeError:
+            structured = None
+    return structured if isinstance(structured, dict) else {}
+
+
+def _render_store_stream(
+    *,
+    report_json: dict[str, Any],
+    project_id: str,
+    conversation_id: str | None,
+    user_id: str | None,
+    title: str,
+    volume: int,
+    emit,
+    writer,
+    existing_report_id: str | None = None,
+) -> str | None:
+    """Render HTML→PDF, upload to the bucket, persist JSON, and stream report_ready."""
+    emit("rendering", "in_progress", "Building the report document…")
+    # HTML backs the downloadable PDF (full-fidelity CSS); markdown backs the
+    # in-app preview panel (no CSS quirks).
+    html = report_template.render_html(report_json)
+    markdown_text = report_template.render_markdown(report_json)
+
+    pdf_url = None
+    report_id = existing_report_id
+    try:
+        pdf_bytes = reports.render_pdf_from_html(html)
+    except Exception as exc:
+        logger.warning("PDF render failed", exc_info=True)
+        record_failure(
+            "rendering", title or "report",
+            "Could not render the report PDF — the report was saved without a PDF",
+            error=exc, context={"project_id": project_id, "report_id": existing_report_id},
+        )
+        pdf_bytes = None
+
+    emit("storing", "started", "Saving your report…")
+    try:
+        if existing_report_id:
+            pdf_path = None
+            if pdf_bytes is not None:
+                pdf_path, pdf_url = reports.upload_report_pdf(existing_report_id, pdf_bytes)
+            reports.update_report(
+                existing_report_id,
+                title=title,
+                volume=volume,
+                report_json=report_json,
+                html=html,
+                markdown_text=markdown_text,
+                pdf_path=pdf_path,
+                pdf_url=pdf_url,
+            )
+            report_id = existing_report_id
+        else:
+            record = reports.create_report(
+                project_id, conversation_id, user_id,
+                title=title, volume=volume, report_json=report_json,
+                html=html, markdown_text=markdown_text, pdf_path=None, pdf_url=None,
+            )
+            report_id = record["id"] if record else None
+            if report_id and pdf_bytes is not None:
+                pdf_path, pdf_url = reports.upload_report_pdf(report_id, pdf_bytes)
+                reports.update_report(report_id, pdf_path=pdf_path, pdf_url=pdf_url)
+        emit("storing", "done", "Report saved.")
+    except Exception as exc:
+        logger.warning("Report storage failed", exc_info=True)
+        record_failure(
+            "storing", title or "report",
+            "Could not finish saving the report (upload/persist failed)",
+            error=exc, context={"project_id": project_id, "report_id": report_id},
+        )
+        emit("storing", "error", "We couldn't finish saving the report — please try again.")
+        return report_id
+
+    emit("report_ready", "done", "Report ready.")
+    writer({
+        "kind": "report_ready",
+        "report_id": report_id,
+        "title": title,
+        "markdown": markdown_text,
+        "pdf_url": pdf_url,
+        "volume": volume,
+        "fx_rate": (report_json.get("fx") or {}).get("rate"),
+    })
+    return report_id
 
 
 def _generate_modification(
@@ -142,52 +332,41 @@ def _generate_modification(
     user_id: str | None,
     modification_request: str,
 ) -> str:
-    """Apply a text modification to the latest report for this conversation."""
+    """Edit the latest report for this conversation, operating on its saved JSON."""
+    emit, writer = _make_emit()
     base = reports.latest_report_for_conversation(conversation_id) if conversation_id else None
-    if base is None:
+    if base is None or not base.get("report_json"):
         return (
-            "There is no existing report in this conversation to modify yet. "
-            "Ask me to generate a report first."
+            "There's no existing report in this conversation to modify yet. "
+            "Ask me to generate a report first, then I can tweak it."
         )
-    _emit("modify", "Applying your requested changes to the report…")
-    from src.services.llm_analysis import invoke_llm
 
-    prompt = (
-        "Revise the following should-cost report markdown per the user's request. "
-        "Keep the same section structure and all factual figures unless the request "
-        "explicitly changes them. Never invent new prices. All amounts are in INR — "
-        "keep them in INR unless the user explicitly asks otherwise. Output ONLY the revised "
-        "markdown — no code fences.\n\nUSER REQUEST:\n"
-        + modification_request
-        + "\n\nCURRENT REPORT MARKDOWN:\n"
-        + (base.get("markdown") or "")
-    )
-    new_markdown = reports.normalize_report_markdown(
-        invoke_llm([{"role": "user", "content": prompt}], max_tokens=8192).strip()
-    )
-    stored_costs = base.get("costs")
-    if isinstance(stored_costs, dict) and stored_costs.get("currency") == "INR":
-        new_markdown = currency.enforce_inr_markdown(new_markdown, stored_costs)
-    title = base.get("title") or "Should-Cost Report"
-    volume = base.get("volume")
-    subtitle = currency.report_subtitle(volume, base.get("costs"))
-    pdf_bytes = reports.render_pdf(new_markdown, title=title, subtitle=subtitle)
-    updated = reports.update_report(
-        base["id"], markdown_text=new_markdown, pdf_bytes=pdf_bytes
-    )
-    report_id = (updated or base)["id"]
-    _writer()(
-        {
-            "kind": "report_ready",
-            "report_id": report_id,
-            "title": title,
-            "markdown": new_markdown,
-            "volume": volume,
-            "fx_rate": (base.get("costs") or {}).get("fx", {}).get("usd_inr"),
-        }
+    report_json = base["report_json"]
+    if isinstance(report_json, str):
+        try:
+            report_json = json.loads(report_json)
+        except json.JSONDecodeError:
+            return "The saved report couldn't be read for editing — please regenerate it."
+
+    emit("rendering", "started", "Applying your requested changes…")
+    report_json, summary = report_edit.apply_edit(report_json, modification_request, emit)
+
+    title = base.get("title") or (report_json.get("meta") or {}).get("title") or "Should-Cost Report"
+    volume = (report_json.get("meta") or {}).get("volume") or base.get("volume") or REPORT_DEFAULT_VOLUME
+
+    _render_store_stream(
+        report_json=report_json,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        user_id=user_id,
+        title=title,
+        volume=int(volume),
+        emit=emit,
+        writer=writer,
+        existing_report_id=base["id"],
     )
     return (
-        f'Updated the report "{title}". The revised PDF is shown on the right and is '
+        f'Updated the report — {summary}. The revised version is shown on the right and the PDF is '
         "ready to download. Let me know if you'd like any other changes."
     )
 
@@ -201,36 +380,39 @@ def report_generation_tool(
     """Generate (or modify) a professional should-cost PDF report for the product.
 
     Call this whenever the user asks to generate a report, a should-cost report,
-    a BOM cost report, a cost breakdown PDF, or anything similar. It reads the
-    project's accumulated knowledge base, asks the user a few clarifying
-    questions only if needed, prices the BOM via DigiKey, renders a PDF, and
-    streams it to the user with a download option.
+    a BOM cost report, a cost breakdown PDF, or similar. It reads the project's
+    knowledge base, asks a few clarifying questions only if needed, prices the BOM
+    (Mouser), quotes the PCB (PCBWay), applies duty and assembly costs across a
+    volume curve, renders a PDF in the locked report format, and streams it.
 
     Args:
         request: The user's request, verbatim (used to infer intent/volume).
-        modification_request: If the user is asking to CHANGE an existing report
-            that was already generated in this conversation, put their change
-            request here; the existing report is revised instead of rebuilt.
+        modification_request: If the user is asking to CHANGE a report already
+            generated in this conversation (e.g. "change the target volume to
+            5000", "remove the LED line", "shorten the executive summary"), put
+            their change request here; the existing report is edited in place.
     """
     cfg = _cfg(config)
     project_id = cfg.get("project_id")
     user_id = cfg.get("user_id")
     conversation_id = cfg.get("conversation_id")
+    thread_id = cfg.get("thread_id")
 
     if not project_id:
         return "No project is associated with this conversation, so I can't build a report."
     if not is_uuid(str(project_id)):
         return invalid_project_id_message(str(project_id))
 
-    # Modification path: revise the existing report instead of rebuilding.
+    # ---- Edit path: revise the existing report instead of rebuilding. ------- #
     if modification_request and modification_request.strip():
         return _generate_modification(
             str(project_id), conversation_id, user_id, modification_request.strip()
         )
 
-    _emit("start", "Starting report generation…")
-    _emit("context", "Reading what we know about the product…")
+    emit, writer = _make_emit()
 
+    # ---- Step 1: read KB ---------------------------------------------------- #
+    emit("reading_kb", "started", "Reading what we know about the product…")
     kb = get_project_knowledge_base(str(project_id))
     if not kb or (not (kb.get("theory_context") or "").strip() and not kb.get("structured_context")):
         return (
@@ -238,30 +420,21 @@ def report_generation_tool(
             "report. Please upload photos of the PCB and product (and any datasheets) "
             "so I can analyze them first, then ask me to generate the report."
         )
-
     theory = (kb.get("theory_context") or "").strip()
-    structured = kb.get("structured_context")
-    if isinstance(structured, str):
-        try:
-            structured = json.loads(structured)
-        except json.JSONDecodeError:
-            structured = None
-    if not isinstance(structured, dict):
-        structured = {}
-
+    structured = _structured_from_kb(kb)
     project_name = get_project_name(str(project_id)) or "this product"
+    product_label = ((structured.get("product") or {}).get("name")) or project_name
+    emit("reading_kb", "done", "Product knowledge loaded.")
 
-    # ---- HILT: ask only the minimal missing questions -------------------- #
-    _emit("assess", "Checking whether I need any details from you…")
-    questions = report_builder.assess_missing(theory, structured, request)
-
+    # ---- Step 2: HILT gap questions ----------------------------------------- #
+    emit("hilt", "started", "Checking whether I need any details from you…")
+    # Cached per thread_id so the resume re-run yields the SAME questions.
+    questions = _assess_questions(thread_id, theory, structured, request)
     answers_by_id: dict[str, dict[str, Any]] = {}
     if questions:
         from langgraph.types import interrupt
 
-        _emit("questions", f"I have {len(questions)} quick question(s) for you.")
         resumed = interrupt({"type": "report_questions", "questions": questions})
-        # `resumed` is whatever the websocket layer passed to Command(resume=...).
         raw_answers = resumed.get("answers") if isinstance(resumed, dict) else resumed
         if isinstance(raw_answers, dict):
             answers_by_id = {k: _normalize_answer(v) for k, v in raw_answers.items()}
@@ -269,117 +442,76 @@ def report_generation_tool(
             for q, a in zip(questions, raw_answers):
                 answers_by_id[q["id"]] = _normalize_answer(a)
 
-        # Persist Q&A and fold answers back into the insight pipeline.
         qa_pairs: list[dict[str, Any]] = []
         for q in questions:
             ans = answers_by_id.get(q["id"], {"answer": "", "file_ids": None, "status": "skipped"})
             try:
                 reports.save_question_answer(
-                    str(project_id),
-                    conversation_id,
-                    user_id,
-                    question=q["prompt"],
-                    kind=q["kind"],
-                    answer=ans["answer"] or None,
-                    file_ids=ans["file_ids"],
-                    status=ans["status"],
+                    str(project_id), conversation_id, user_id,
+                    question=q["prompt"], kind=q["kind"],
+                    answer=ans["answer"] or None, file_ids=ans["file_ids"], status=ans["status"],
                 )
             except Exception:
                 logger.warning("Failed to persist report question", exc_info=True)
-            qa_pairs.append(
-                {
-                    "question": q["prompt"],
-                    "answer": ans["answer"],
-                    "file_ids": ans["file_ids"],
-                }
-            )
+            qa_pairs.append({"question": q["prompt"], "answer": ans["answer"], "file_ids": ans["file_ids"]})
+
+        # Fold the answers into THIS report run (sharpen MPNs/specs), then queue
+        # the same facts for the async KB recompute so future reports benefit too.
+        if any(p.get("answer") or p.get("file_ids") for p in qa_pairs):
+            try:
+                structured, theory = _merge_qa_into_product(structured, theory, qa_pairs)
+                product_label = ((structured.get("product") or {}).get("name")) or product_label
+            except Exception:
+                logger.warning("Failed to fold Q&A answers into the report", exc_info=True)
         try:
             enqueue_qa_insight(str(project_id), user_id, qa_pairs)
         except Exception:
             logger.warning("Failed to enqueue Q&A insight ingestion", exc_info=True)
+    # Resume consumed the cached assessment — release it.
+    if thread_id:
+        _ASSESS_CACHE.pop(thread_id, None)
+    emit("hilt", "done", "Thanks — using your details." if questions else "No extra details needed.")
 
-    # ---- Determine production volume ------------------------------------- #
-    volume = _parse_volume(request)
-    if volume is None:
-        for qid, ans in answers_by_id.items():
-            if "volume" in qid.lower() or "qty" in qid.lower() or "unit" in qid.lower():
-                volume = _parse_volume(ans["answer"])
-                if volume:
-                    break
-    assumed_volume = volume is None
-    volume = volume or REPORT_DEFAULT_VOLUME
+    # ---- Determine production volume ---------------------------------------- #
+    # The report is always for a SINGLE unit. We do not parse a production volume
+    # from the request — costs are the recurring per-unit cost, with one-time NRE
+    # reported separately (never amortized over a quantity).
+    volume = 1
 
-    # ---- Resolve + price the BOM via DigiKey ---------------------------- #
-    _emit("digikey", "Resolving and pricing components via DigiKey…")
-    bom = report_builder.resolve_and_price_bom(structured, volume, progress=lambda p: _emit(p.get("stage", "digikey"), p.get("message", "")))
-    costs = report_builder.estimate_costs(structured, bom, volume)
-    if assumed_volume:
-        bom.setdefault("notes", []).append(
-            f"Production volume not specified — assumed {volume:,} units."
-        )
-
-    # ---- USD → INR conversion (spot rate via Tavily) ------------------- #
-    _emit("fx", "Fetching USD → INR exchange rate…")
-    usd_inr, fx_source = currency.fetch_usd_inr_rate()
-    costs = currency.convert_costs_to_inr(costs, usd_inr, source=fx_source)
-
-    # ---- Optional web context ------------------------------------------- #
-    web_context = None
-    product_label = ((structured.get("product") or {}).get("name")) or project_name
-    if product_label and product_label != "this product":
-        _emit("web", "Pulling extra market/product context from the web…")
-        web_context = _tavily_context(
-            f"{product_label} electronics product specifications and market price"
-        )
-
-    # ---- Compose + render ----------------------------------------------- #
-    _emit("compose", "Writing the report…")
-    precomputed = currency.build_precomputed_cost_blocks(costs)
-    markdown_text = reports.normalize_report_markdown(
-        report_builder.compose_report_markdown(
-            REPORT_PROMPT,
-            theory,
-            structured,
-            costs,
-            volume,
-            web_context,
-            precomputed=precomputed,
-        )
+    # ---- Steps 3–9: run the pipeline ---------------------------------------- #
+    report_json = report_pipeline.run_pipeline(
+        structured=structured,
+        theory=theory,
+        product_label=product_label,
+        volume=volume,
+        emit=emit,
     )
-    markdown_text = currency.enforce_inr_markdown(markdown_text, costs)
+    # The report is always single-unit: per-unit recurring cost, with one-time NRE
+    # (tooling/firmware/line setup) reported separately — never amortized in.
+    report_json.setdefault("dataQuality", []).append(
+        "Figures are the recurring cost to build a single unit. One-time tooling, firmware "
+        "and line-setup (NRE) is listed separately and is not included in the per-unit cost."
+    )
 
-    title = f"Should-Cost Report — {product_label}" if product_label else "Should-Cost Report"
-    subtitle = currency.report_subtitle(volume, costs)
-    _emit("pdf", "Rendering the PDF…")
-    pdf_bytes = reports.render_pdf(markdown_text, title=title, subtitle=subtitle)
-
-    record = reports.create_report(
-        str(project_id),
-        conversation_id,
-        user_id,
+    # ---- Steps 10–11: render, store, stream --------------------------------- #
+    title = report_json.get("meta", {}).get("title") or f"Should-Cost Report — {product_label}"
+    _render_store_stream(
+        report_json=report_json,
+        project_id=str(project_id),
+        conversation_id=conversation_id,
+        user_id=user_id,
         title=title,
         volume=volume,
-        markdown_text=markdown_text,
-        costs=costs,
-        pdf_bytes=pdf_bytes,
-    )
-    report_id = record["id"] if record else None
-
-    _writer()(
-        {
-            "kind": "report_ready",
-            "report_id": report_id,
-            "title": title,
-            "markdown": markdown_text,
-            "volume": volume,
-            "fx_rate": costs.get("fx", {}).get("usd_inr"),
-        }
+        emit=emit,
+        writer=writer,
     )
 
-    summary = (
-        f'I generated the should-cost report "{title}" (assumed {volume:,} units). '
-        "It's shown on the right and ready to download. "
-        "Would you like any modifications — different volume, more detail in a section, "
-        "or anything else?"
+    live = report_json.get("bom", {}).get("live_count", 0)
+    total_lines = live + report_json.get("bom", {}).get("est_count", 0)
+    note = "" if not report_json.get("dataQuality") else " Some figures use industry estimates where live data wasn't available — see the Data Confidence notes."
+    return (
+        f'I generated the single-unit should-cost report "{title}" '
+        f"({live} of {total_lines} BOM lines priced live).{note} "
+        "It's the recurring cost to build one unit, with one-time tooling/NRE listed separately. "
+        "It's shown on the right and the PDF is ready to download — want a line removed or more detail in a section?"
     )
-    return summary

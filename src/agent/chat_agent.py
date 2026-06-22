@@ -403,13 +403,18 @@ async def _stream_agent_events(
                     yield {
                         "type": "report_progress",
                         "stage": chunk.get("stage", ""),
+                        "status": chunk.get("status", "in_progress"),
                         "message": chunk.get("message", ""),
+                        "progress": chunk.get("progress"),
+                        "meta": chunk.get("meta", {}),
                     }
                 elif kind == "report_ready":
                     yield {
                         "type": "report_ready",
                         "report_id": chunk.get("report_id"),
                         "title": chunk.get("title"),
+                        "html": chunk.get("html"),
+                        "pdf_url": chunk.get("pdf_url"),
                         "markdown": chunk.get("markdown"),
                         "volume": chunk.get("volume"),
                         "fx_rate": chunk.get("fx_rate"),

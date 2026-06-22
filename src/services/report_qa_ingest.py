@@ -34,34 +34,50 @@ QUESTIONS AND ANSWERS (JSON):
 """
 
 
+def answered_pairs(qa_pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter to questions the user actually answered (text or file)."""
+    return [
+        qa
+        for qa in (qa_pairs or [])
+        if isinstance(qa, dict) and (qa.get("answer") or qa.get("file_ids"))
+    ]
+
+
+def extract_qa_facts(
+    qa_pairs: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any] | None]:
+    """Extract (theory, structured) facts from answered questions. ``(\"\", None)`` if none.
+
+    Shared by the async KB-ingest job and the synchronous in-report merge so the
+    answers shape the report being generated, not just future ones.
+    """
+    answered = answered_pairs(qa_pairs)
+    if not answered:
+        return "", None
+    prompt = _QA_INSIGHT_PROMPT.format(qa=json.dumps(answered, ensure_ascii=False)[:8000])
+    try:
+        raw = invoke_llm([{"role": "user", "content": prompt}], max_tokens=2048)
+        data = parse_json_object(raw) or {}
+    except Exception:
+        logger.exception("Q&A fact extraction failed")
+        return "", None
+    theory = str(data.get("theory") or "").strip()
+    structured = data.get("structured")
+    if not isinstance(structured, dict):
+        structured = None
+    return theory, structured
+
+
 def ingest_qa_insight(
     project_id: str,
     user_id: str | None,
     qa_pairs: list[dict[str, Any]],
 ) -> None:
     """Extract facts from answered questions and record them as an insight."""
-    answered = [
-        qa
-        for qa in (qa_pairs or [])
-        if isinstance(qa, dict) and (qa.get("answer") or qa.get("file_ids"))
-    ]
-    if not answered:
+    if not answered_pairs(qa_pairs):
         return
 
-    prompt = _QA_INSIGHT_PROMPT.format(
-        qa=json.dumps(answered, ensure_ascii=False)[:8000]
-    )
-    try:
-        raw = invoke_llm([{"role": "user", "content": prompt}], max_tokens=2048)
-        data = parse_json_object(raw) or {}
-    except Exception:
-        logger.exception("Q&A insight extraction failed for project %s", project_id)
-        return
-
-    theory = str(data.get("theory") or "").strip()
-    structured = data.get("structured")
-    if not isinstance(structured, dict):
-        structured = None
+    theory, structured = extract_qa_facts(qa_pairs)
     if not theory and not structured:
         logger.info("Q&A produced no extractable facts for project %s", project_id)
         return

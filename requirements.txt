@@ -22,3 +22,4 @@ openpyxl
 httpx
 markdown
 xhtml2pdf
+playwright
