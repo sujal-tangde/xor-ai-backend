@@ -23,9 +23,13 @@ Pass:
 - `request`: the user's message verbatim (it is used to infer intent and any
   stated production volume, e.g. "10k units").
 - `modification_request`: ONLY when the user is asking to change a report that
-  was already generated in this conversation (e.g. "use 5,000 units instead",
-  "add more detail to the assembly section"). Put their change request here so
-  the existing report is revised instead of rebuilt from scratch.
+  was already generated in this conversation (e.g. "change the title to X",
+  "rename the report", "use 5,000 units instead", "remove the LED line", "add
+  more detail to the assembly section", "attach this photo to the PDF and
+  regenerate"). Put their change request here so the existing report is revised
+  in place instead of rebuilt from scratch. If the user attached an image to
+  embed, the attached file IDs reach the tool automatically — just convey the
+  attach intent in the change request.
 
 ## What the tool does (so you can set expectations)
 

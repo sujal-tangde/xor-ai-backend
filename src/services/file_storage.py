@@ -256,6 +256,33 @@ def get_files_by_ids(file_ids: list[str]) -> list[dict[str, Any]]:
     return result.data or []
 
 
+def get_image_refs_by_ids(file_ids: list[str]) -> list[dict[str, Any]]:
+    """Resolve image file IDs into renderable references for the report.
+
+    Returns ``[{"id", "name", "url"}]`` for the IDs that are images, preferring
+    the compressed JPEG (smaller, always present for images) and falling back to
+    the original. Non-image files and IDs without a usable URL are skipped.
+    """
+    if not file_ids:
+        return []
+    client = get_supabase()
+    result = (
+        client.table("uploaded_files")
+        .select("id, name, original_url, compressed_url, file_type")
+        .in_("id", [str(fid) for fid in file_ids])
+        .execute()
+    )
+    refs: list[dict[str, Any]] = []
+    for row in result.data or []:
+        if (row.get("file_type") or "").lower() != "image":
+            continue
+        url = row.get("compressed_url") or row.get("original_url")
+        if not url:
+            continue
+        refs.append({"id": row.get("id"), "name": row.get("name"), "url": url})
+    return refs
+
+
 def _storage_path_from_url(url: str, bucket: str) -> str | None:
     marker = f"/object/public/{bucket}/"
     idx = url.find(marker)

@@ -25,7 +25,24 @@
       "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main; print\\('app imports OK'\\)\")",
       "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool, src.services.report_template, src.services.report_pipeline; print\\('backend imports OK'\\)\")",
       "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool, src.services.report_qa_ingest, src.services.report_builder; print\\('OK'\\)\")",
-      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool; print\\('backend imports OK'\\)\")"
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe -c \"import src.main, src.agent.tools.report_tool; print\\('backend imports OK'\\)\")",
+      "PowerShell(python -m py_compile src/agent/chat_agent.py src/agent/tools/report_tool.py src/services/report_edit.py src/services/report_template.py src/services/file_storage.py; if \\($?\\) { \"OK - all compiled\" })",
+      "PowerShell(python -c \"import re, sys; sys.path.insert\\(0,'.'\\); from src.agent.chat_agent import _is_conversational_message as c, _needs_tools as n; tests=['just do it','do it','regenerate as Reverse Engineering Cost Report - Test Project','go ahead','hi','thanks','ok','what can you do?','ok do it','change the title to Test report','yes']; [print\\(f'{t!r:60} conversational={c\\(t\\)} needs_tools={n\\([{\\\\\"role\\\\\":\\\\\"user\\\\\",\\\\\"content\\\\\":t}]\\)}'\\) for t in tests]\")",
+      "Bash(cat)",
+      "Bash(rm /tmp/_t.py)",
+      "PowerShell(python -m py_compile src/agent/chat_agent.py src/agent/tools/report_tool.py src/services/report_edit.py src/services/report_template.py src/services/file_storage.py; if \\($?\\) { \"COMPILE OK\" })",
+      "Bash(rm /tmp/_rt2.py)",
+      "Bash(rm /tmp/_rt3.py)",
+      "Bash(rm /tmp/_diag.py)",
+      "Bash(curl -s -o /dev/null -w 'HTTP %{http_code}  type=%{content_type}  bytes=%{size_download}\\\\n' -L https://skzkvpkgajdvasrbvtdh.supabase.co/storage/v1/object/public/compressed_uploads/0b40faa0-310d-4039-bc45-2478b2544140.jpg)",
+      "Bash(curl -s -L https://skzkvpkgajdvasrbvtdh.supabase.co/storage/v1/object/public/compressed_uploads/0b40faa0-310d-4039-bc45-2478b2544140.jpg)",
+      "Bash(xxd)",
+      "Bash(rm /tmp/_cols.py)",
+      "Bash(rm /tmp/_pos.py)",
+      "Bash(curl -s -L https://skzkvpkgajdvasrbvtdh.supabase.co/storage/v1/object/public/reports/8d223116-8148-4248-a743-082097d44407.pdf -o /tmp/r.pdf)",
+      "Read(//tmp/**)",
+      "Bash(rm /tmp/r.pdf)",
+      "Bash(node *)"
     ]
   }
 }

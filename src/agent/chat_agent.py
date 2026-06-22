@@ -73,7 +73,22 @@ _PRODUCT_KEYWORDS_RE = re.compile(
     r"bom|pcb|component|cost|price|upload|image|photo|datasheet|schematic|"
     r"reverse.?engineer|should.?cost|enclosure|mcu|connector|pinout|layer|"
     r"analy(?:s[ei]|ze)|product|project|file|document|manual|spec|board|part|"
-    r"ic|chip|assembly|fabricat|sourc|estimate|know about|uploaded|analyzed"
+    r"ic|chip|assembly|fabricat|sourc|estimate|know about|uploaded|analyzed|"
+    r"report|re.?generate|pdf|generate|markdown|title"
+    r")\b",
+    re.IGNORECASE,
+)
+# Imperative / confirmation follow-ups ("just do it", "go ahead", "regenerate",
+# "yes do it"). These are ACTIONS, not small talk — they must reach the tool
+# agent (which has the conversation history and can act on the prior request).
+# Without this, short commands fall through to the no-tools greeting path, where
+# the model fabricates a "done" reply without ever calling a tool.
+_COMMAND_RE = re.compile(
+    r"\b(?:"
+    r"do it|just do it|do that|go ahead|go for it|make it|proceed|continue|"
+    r"re-?generate|re-?gen|re-?do|generate|create|build|render|update|change|"
+    r"rename|re-?title|edit|modify|revise|adjust|set|rewrite|"
+    r"add|remove|delete|attach|include|insert|fix|apply"
     r")\b",
     re.IGNORECASE,
 )
@@ -142,7 +157,26 @@ def _system_prompt() -> str:
         "voltage', 'any certifications mentioned').\n"
         "- tavily_search: live web search for external data — current component "
         "prices, datasheets, MPN lookups, market info. Cite sources and prefer the "
-        "most recent figures.\n\n"
+        "most recent figures.\n"
+        "- report_generation: the should-cost PDF report tool. You MUST call this "
+        "tool — never write a report yourself — whenever the user asks to GENERATE "
+        "a report, should-cost report, BOM cost report, cost breakdown, or cost "
+        "PDF. Pass the user's message as `request`. The tool reads the project KB, "
+        "asks a few clarifying questions if needed, prices the BOM, renders the "
+        "PDF, and streams it to the screen.\n"
+        "  ALSO call report_generation to CHANGE a report already generated in this "
+        "conversation — e.g. \"change the title to X\", \"rename the report\", "
+        "\"regenerate it\", \"remove the LED line\", \"add more detail to the "
+        "assembly section\", \"use 5000 units\". For ANY such edit/regenerate "
+        "request, call report_generation and put the user's change request verbatim "
+        "in `modification_request` (leave `request` as the user's message). Do not "
+        "say you've updated the report unless you actually called the tool.\n"
+        "  If the user ATTACHED an image and asks to add/embed/attach it to the "
+        "report (e.g. \"attach this photo to the PDF and regenerate\"), call "
+        "report_generation with that intent in `modification_request` AND pass the "
+        "attached file IDs in the `file_ids` argument so the tool embeds the image "
+        "and re-renders the PDF. If the tool's result says the image could not be "
+        "embedded, relay that honestly — do NOT claim the image was added.\n\n"
         "Combine stored evidence with web search when the user wants both hardware "
         "details and current external info (e.g. a part's datasheet or price). If "
         "you still don't know something after using the tools, say so instead of "
@@ -214,6 +248,11 @@ def _is_conversational_message(text: str) -> bool:
     if not cleaned:
         return True
     if _PRODUCT_KEYWORDS_RE.search(cleaned):
+        return False
+    # Imperative/confirmation commands ("just do it", "go ahead") are actions, not
+    # small talk — route them to the tool agent even though they're short. Checked
+    # BEFORE the greeting regex so "ok do it" still reaches the tools.
+    if _COMMAND_RE.search(cleaned):
         return False
     if _CONVERSATIONAL_RE.match(cleaned):
         return True
@@ -317,7 +356,13 @@ def _greeting_prompt() -> str:
         "measurements, and invite them to share something or ask a question.\n\n"
         "Do NOT refuse, do NOT lecture, do NOT list rigid bullet-point "
         "requirements, and do NOT say you can't help with greetings. Just be "
-        "friendly and welcoming."
+        "friendly and welcoming.\n\n"
+        "You have NO tools in this mode and cannot generate, edit, or regenerate "
+        "reports or PDFs. NEVER claim you generated, updated, renamed, or "
+        "regenerated a report or that a file is ready — you did not. If the user "
+        "seems to be asking for a report or a change to one, briefly invite them "
+        "to restate the request (e.g. \"sure — tell me what to call it and I'll "
+        "regenerate it\") instead of pretending it's done."
     )
 
 
@@ -341,6 +386,7 @@ def _agent_config(
     project_id: str | None,
     user_id: str | None,
     conversation_id: str | None,
+    file_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the LangGraph config that threads request context into tools."""
     return {
@@ -349,6 +395,10 @@ def _agent_config(
             "project_id": project_id,
             "user_id": user_id,
             "conversation_id": conversation_id,
+            # File IDs attached to the latest user message. Threaded here (not just
+            # the prompt hint) so report_generation can embed attached images
+            # without relying on the model to forward the IDs.
+            "file_ids": file_ids or [],
         }
     }
 
@@ -551,7 +601,15 @@ async def chat_stream(
         return
 
     thread_id = str(uuid.uuid4())
-    config = _agent_config(thread_id, project_id, user_id, conversation_id)
+    latest = _latest_user_turn(messages)
+    latest_file_ids = (
+        [str(fid) for fid in latest.get("file_ids")]
+        if latest and latest.get("file_ids")
+        else []
+    )
+    config = _agent_config(
+        thread_id, project_id, user_id, conversation_id, file_ids=latest_file_ids
+    )
     agent_input: dict[str, Any] = {"messages": lc_messages}
     skill_files = _skill_files()
     if skill_files:

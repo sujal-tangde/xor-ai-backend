@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from src.services import mouser, report_pipeline
@@ -40,6 +41,12 @@ Classify it into concrete operations against the report state below. Do NOT comp
 WHAT to change; the system recomputes costs deterministically.
 
 Operation types you may emit (in an "operations" array):
+- {{"op": "set_title", "title": "<new report title>"}}        rename the report / change its title
+- {{"op": "remove_section", "section": "architecture"}}       hide a whole section. section is one of: \
+executive | product_overview | architecture | cost_by_stage | bom | fab_assembly | market | methodology
+- {{"op": "add_image", "position": "after_executive", "caption": "<optional caption>"}}   embed the user's \
+ATTACHED image(s) in the report. Use position "after_executive" if they want it below the executive summary, \
+else "end". Emit this whenever the user asks to attach/add/embed/include/insert an image or photo.
 - {{"op": "set_volume", "volume": 5000}}                      target production volume
 - {{"op": "set_qty", "match": "<mpn/designator/text>", "qty": 3}}
 - {{"op": "remove_line", "match": "<mpn/designator/text>"}}
@@ -149,8 +156,64 @@ def _rewrite_prose(report_json: dict[str, Any], field: str, instruction: str) ->
     return False
 
 
-def apply_edit(report_json: dict[str, Any], request: str, emit=None) -> tuple[dict[str, Any], str]:
-    """Apply an edit to a saved report_json. Returns ``(report_json, summary)``."""
+# Canonical section keys (match the renderer) + the aliases a model might emit.
+_SECTION_ALIASES = {
+    "executive": "executive", "executive_summary": "executive", "summary": "executive",
+    "product_overview": "product_overview", "product": "product_overview", "overview": "product_overview",
+    "architecture": "architecture", "architecture_analysis": "architecture", "arch": "architecture",
+    "cost_by_stage": "cost_by_stage", "cost_by_manufacturing_stage": "cost_by_stage",
+    "stages": "cost_by_stage", "manufacturing_stage": "cost_by_stage",
+    "bom": "bom", "bill_of_materials": "bom",
+    "fab_assembly": "fab_assembly", "fabrication": "fab_assembly", "assembly": "fab_assembly",
+    "pcb_fabrication": "fab_assembly", "fab": "fab_assembly",
+    "market": "market", "market_context": "market",
+    "methodology": "methodology", "confidence": "methodology", "methodology_confidence": "methodology",
+}
+
+
+def _canonical_section(name: str) -> str | None:
+    key = re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+    if not key:
+        return None
+    if key in _SECTION_ALIASES:
+        return _SECTION_ALIASES[key]
+    # Tolerate a leading section number / extra words ("3_architecture_analysis").
+    # Prefer the longest alias that appears as a token-substring of the key.
+    for alias in sorted(_SECTION_ALIASES, key=len, reverse=True):
+        if alias in key:
+            return _SECTION_ALIASES[alias]
+    return None
+
+
+def _add_images(report_json: dict[str, Any], image_refs: list[dict[str, Any]],
+                position: str, caption: str | None) -> int:
+    if not image_refs:
+        return 0
+    images = report_json.setdefault("images", [])
+    existing_urls = {img.get("url") for img in images if isinstance(img, dict)}
+    pos = "after_executive" if str(position).lower() == "after_executive" else "end"
+    added = 0
+    for ref in image_refs:
+        url = ref.get("url")
+        if not url or url in existing_urls:
+            continue
+        images.append({"url": url, "caption": caption or ref.get("name") or "", "position": pos})
+        existing_urls.add(url)
+        added += 1
+    return added
+
+
+def apply_edit(
+    report_json: dict[str, Any],
+    request: str,
+    emit=None,
+    image_refs: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Apply an edit to a saved report_json. Returns ``(report_json, summary)``.
+
+    ``image_refs`` are the user's attached images (``[{"url","name"}]``) available
+    to embed when the edit asks to attach an image.
+    """
     emit = emit or (lambda *a, **k: None)
     classification = classify_edit(request, report_json)
     operations = classification.get("operations") or []
@@ -166,7 +229,29 @@ def apply_edit(report_json: dict[str, Any], request: str, emit=None) -> tuple[di
             continue
         kind = op.get("op")
 
-        if kind == "rewrite_prose":
+        if kind == "set_title":
+            new_title = str(op.get("title") or "").strip()
+            if new_title:
+                report_json.setdefault("meta", {})["title"] = new_title
+                changes.append(f'title → "{new_title}"')
+
+        elif kind == "remove_section":
+            section = _canonical_section(str(op.get("section") or ""))
+            if section:
+                hidden = report_json.setdefault("hidden_sections", [])
+                if section not in hidden:
+                    hidden.append(section)
+                    changes.append(f"removed the {section.replace('_', ' ')} section")
+
+        elif kind == "add_image":
+            added = _add_images(
+                report_json, image_refs or [],
+                op.get("position", "end"), op.get("caption"),
+            )
+            if added:
+                changes.append(f"attached {added} image(s)")
+
+        elif kind == "rewrite_prose":
             if _rewrite_prose(report_json, op.get("field", ""), op.get("instruction", request)):
                 changes.append(f"rewrote {op.get('field')}")
 

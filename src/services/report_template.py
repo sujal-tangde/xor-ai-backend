@@ -123,13 +123,14 @@ def _confidence_tag(level: str | None) -> str:
 def _cover(rj: dict[str, Any]) -> str:
     meta = rj.get("meta") or {}
     product = rj.get("product") or {}
+    title = meta.get("title") or "Reverse Engineering Cost Report"
     return f"""
   <div class="cover">
     <div class="org">
       <span class="logo">ELECBITS · TEARDOWN COST ENGINE</span>
       <span class="conf">Confidential — Internal</span>
     </div>
-    <h1>Reverse Engineering Cost Report</h1>
+    <h1>{esc(title)}</h1>
     <p class="subtitle">{esc(product.get('name'))}{(' — ' + esc(product.get('subtitle'))) if product.get('subtitle') else ''}</p>
     <div class="docmeta">
       <div><div class="k">Product</div><div class="v">{esc(product.get('name'))}</div></div>
@@ -421,6 +422,39 @@ def _methodology(rj: dict[str, Any]) -> str:
   </section>"""
 
 
+def _images(rj: dict[str, Any]) -> str:
+    images = [img for img in (rj.get("images") or []) if isinstance(img, dict) and img.get("url")]
+    if not images:
+        return ""
+    cards = ""
+    for img in images:
+        caption = (
+            f'<figcaption style="font-size:10.5px;color:var(--muted);margin-top:5px">'
+            f'{esc(img.get("caption"))}</figcaption>'
+        ) if img.get("caption") else ""
+        cards += (
+            f'<figure style="margin:0">'
+            f'<img src="{esc(img.get("url"))}" alt="{esc(img.get("caption") or "attached image")}" '
+            f'style="width:100%;border:1px solid var(--line);border-radius:4px"/>'
+            f"{caption}</figure>"
+        )
+    return f"""
+  <section>
+    <div class="sec-no">IMG</div>
+    <div class="sec-h">Reference Images</div>
+    <p class="lead">Images attached by the user for this report.</p>
+    <div class="threecol" style="gap:18px">{cards}</div>
+  </section>"""
+
+
+def _image_position(rj: dict[str, Any]) -> str:
+    """Where the attached-images block goes: 'after_executive' or 'end'."""
+    for img in rj.get("images") or []:
+        if isinstance(img, dict) and (img.get("position") or "").lower() == "after_executive":
+            return "after_executive"
+    return "end"
+
+
 # --------------------------------------------------------------------------- #
 # Markdown rendering (for the in-app preview panel — avoids the PDF's CSS).
 # The PDF still renders from render_html(); this is display-only and carries the
@@ -446,12 +480,25 @@ def _md_table(header: list[str], aligns: list[str], rows: list[list[str]]) -> st
     return "\n".join(lines)
 
 
+def _md_images(rj: dict[str, Any]) -> list[str]:
+    images = [img for img in (rj.get("images") or []) if isinstance(img, dict) and img.get("url")]
+    if not images:
+        return []
+    blocks = ["## Reference Images"]
+    for img in images:
+        caption = str(img.get("caption") or "attached image")
+        blocks.append(f"![{caption}]({img['url']})")
+        if img.get("caption"):
+            blocks.append(f"*{img['caption']}*")
+    return blocks
+
+
 def render_markdown(report_json: dict[str, Any]) -> str:
     rj = report_json or {}
     meta = rj.get("meta") or {}
     product = rj.get("product") or {}
     metrics = rj.get("metrics") or {}
-    fx = rj.get("fx") or {}
+    hidden = {str(s).lower() for s in (rj.get("hidden_sections") or [])}
     out: list[str] = []
 
     # Header
@@ -462,137 +509,156 @@ def render_markdown(report_json: dict[str, Any]) -> str:
     sub_bits.append("All costs in INR (₹)")
     out.append("*" + " · ".join(sub_bits) + "*")
 
+    image_blocks = _md_images(rj)
+    img_after_exec = _image_position(rj) == "after_executive"
+
     # 01 Executive Summary
-    out.append("## 01 · Executive Summary")
-    if product.get("summary_prose"):
-        out.append(str(product["summary_prose"]).strip())
-    bom_per_unit = (rj.get("bom") or {}).get("subtotal_inr")
-    out.append(_md_table(
-        ["Metric", "Value"], ["---", "---:"],
-        [
-            ["Unit cost (1 unit)", fmt_inr(metrics.get("ex_works_selected"))],
-            ["BOM cost / unit (landed)", fmt_inr(bom_per_unit)],
-            ["One-time NRE (separate)", fmt_inr(metrics.get("one_time_nre_inr"), 0)],
-        ],
-    ))
-    dc = rj.get("dataConfidence") or {}
-    if dc.get("prose"):
-        out.append(f"> **Data Confidence & Notes.** {dc['prose']}")
-    findings = product.get("key_findings") or []
-    if findings:
-        out.append("**Key findings.**\n" + "\n".join(f"- {f}" for f in findings))
+    if "executive" not in hidden:
+        out.append("## 01 · Executive Summary")
+        if product.get("summary_prose"):
+            out.append(str(product["summary_prose"]).strip())
+        bom_per_unit = (rj.get("bom") or {}).get("subtotal_inr")
+        out.append(_md_table(
+            ["Metric", "Value"], ["---", "---:"],
+            [
+                ["Unit cost (1 unit)", fmt_inr(metrics.get("ex_works_selected"))],
+                ["BOM cost / unit (landed)", fmt_inr(bom_per_unit)],
+                ["One-time NRE (separate)", fmt_inr(metrics.get("one_time_nre_inr"), 0)],
+            ],
+        ))
+        dc = rj.get("dataConfidence") or {}
+        if dc.get("prose"):
+            out.append(f"> **Data Confidence & Notes.** {dc['prose']}")
+        findings = product.get("key_findings") or []
+        if findings:
+            out.append("**Key findings.**\n" + "\n".join(f"- {f}" for f in findings))
+
+    # Reference images placed directly below the Executive Summary, if requested.
+    if image_blocks and img_after_exec:
+        out.extend(image_blocks)
 
     # 02 Product Overview
-    out.append("## 02 · Product Overview")
-    overview = product.get("overview") or []
-    if overview:
-        out.append(_md_table(
-            ["Field", "Value"], ["---", "---"],
-            [[_mc(r.get("k")), _mc(r.get("v"))] for r in overview],
-        ))
-    subs = product.get("subsystems") or []
-    if subs:
-        out.append("**Identified subsystems & evidence quality**")
-        out.append(_md_table(
-            ["Subsystem", "Identification basis", "Conf."], ["---", "---", "---"],
-            [[_mc(s.get("subsystem")), _mc(s.get("basis")), _mc(s.get("confidence"))] for s in subs],
-        ))
+    if "product_overview" not in hidden:
+        out.append("## 02 · Product Overview")
+        overview = product.get("overview") or []
+        if overview:
+            out.append(_md_table(
+                ["Field", "Value"], ["---", "---"],
+                [[_mc(r.get("k")), _mc(r.get("v"))] for r in overview],
+            ))
+        subs = product.get("subsystems") or []
+        if subs:
+            out.append("**Identified subsystems & evidence quality**")
+            out.append(_md_table(
+                ["Subsystem", "Identification basis", "Conf."], ["---", "---", "---"],
+                [[_mc(s.get("subsystem")), _mc(s.get("basis")), _mc(s.get("confidence"))] for s in subs],
+            ))
 
     # 03 Architecture Analysis
-    arch = rj.get("architecture") or {}
-    out.append("## 03 · Architecture Analysis")
-    if arch.get("prose"):
-        out.append(str(arch["prose"]).strip())
-    blocks = arch.get("blocks") or []
-    if blocks:
-        out.append("\n".join(
-            f"- **{_mc(b.get('block'))}** — {_mc(b.get('description'))}" for b in blocks
-        ))
-    if arch.get("insight"):
-        out.append(f"> **Cost-driver insight:** {arch['insight']}")
+    if "architecture" not in hidden:
+        arch = rj.get("architecture") or {}
+        out.append("## 03 · Architecture Analysis")
+        if arch.get("prose"):
+            out.append(str(arch["prose"]).strip())
+        blocks = arch.get("blocks") or []
+        if blocks:
+            out.append("\n".join(
+                f"- **{_mc(b.get('block'))}** — {_mc(b.get('description'))}" for b in blocks
+            ))
+        if arch.get("insight"):
+            out.append(f"> **Cost-driver insight:** {arch['insight']}")
 
     # 04 Cost by Manufacturing Stage
-    stages = rj.get("stages") or {}
-    out.append("## 04 · Cost by Manufacturing Stage (1 unit, recurring)")
-    stage_rows = [
-        [_mc(r.get("stage")), f"{r.get('pct', 0):.0f}%", fmt_inr(r.get("amount"))]
-        for r in stages.get("rows") or []
-    ]
-    stage_rows.append(["**Total unit cost (1 unit)**", "", f"**{fmt_inr(stages.get('total'))}**"])
-    out.append(_md_table(["Stage", "Share", "Per-unit"], ["---", "---:", "---:"], stage_rows))
+    if "cost_by_stage" not in hidden:
+        stages = rj.get("stages") or {}
+        out.append("## 04 · Cost by Manufacturing Stage (1 unit, recurring)")
+        stage_rows = [
+            [_mc(r.get("stage")), f"{r.get('pct', 0):.0f}%", fmt_inr(r.get("amount"))]
+            for r in stages.get("rows") or []
+        ]
+        stage_rows.append(["**Total unit cost (1 unit)**", "", f"**{fmt_inr(stages.get('total'))}**"])
+        out.append(_md_table(["Stage", "Share", "Per-unit"], ["---", "---:", "---:"], stage_rows))
 
     # 05 Bill of Materials
-    bom = rj.get("bom") or {}
-    bom_rows = [
-        [
-            _mc(r.get("sno")), _mc(r.get("mpn")), _mc(r.get("make")), _mc(r.get("description")),
-            _mc(r.get("designator")), _mc(r.get("qty")), _mc(r.get("pkg")),
-            fmt_inr(r.get("unit_inr")), _mc(r.get("bcd_igst")), fmt_inr(r.get("ext_inr")),
-            _mc(_tag_text(r.get("tag"), r.get("source"))),
+    if "bom" not in hidden:
+        bom = rj.get("bom") or {}
+        bom_rows = [
+            [
+                _mc(r.get("sno")), _mc(r.get("mpn")), _mc(r.get("make")), _mc(r.get("description")),
+                _mc(r.get("designator")), _mc(r.get("qty")), _mc(r.get("pkg")),
+                fmt_inr(r.get("unit_inr")), _mc(r.get("bcd_igst")), fmt_inr(r.get("ext_inr")),
+                _mc(_tag_text(r.get("tag"), r.get("source"))),
+            ]
+            for r in bom.get("rows") or []
         ]
-        for r in bom.get("rows") or []
-    ]
-    bom_rows.append(["", "", "", "", "", "", "", "", "**Subtotal**", f"**{fmt_inr(bom.get('subtotal_inr'))}**", ""])
-    out.append("## 05 · Bill of Materials")
-    out.append(_md_table(
-        ["S.No", "MPN", "Make", "Description", "Desig.", "Qty", "Pkg", "Unit ₹", "BCD/IGST", "Ext ₹", "Source"],
-        ["---:", "---", "---", "---", "---", "---:", "---", "---:", "---", "---:", "---"],
-        bom_rows,
-    ))
-    out.append("*Duty is modeled per-MPN from the inferred HSN code. Lines tagged Est are rate-card estimates.*")
+        bom_rows.append(["", "", "", "", "", "", "", "", "**Subtotal**", f"**{fmt_inr(bom.get('subtotal_inr'))}**", ""])
+        out.append("## 05 · Bill of Materials")
+        out.append(_md_table(
+            ["S.No", "MPN", "Make", "Description", "Desig.", "Qty", "Pkg", "Unit ₹", "BCD/IGST", "Ext ₹", "Source"],
+            ["---:", "---", "---", "---", "---", "---:", "---", "---:", "---", "---:", "---"],
+            bom_rows,
+        ))
+        out.append("*Duty is modeled per-MPN from the inferred HSN code. Lines tagged Est are rate-card estimates.*")
 
     # 06 PCB Fab & Assembly
-    fab = rj.get("fab") or {}
-    params = fab.get("params") or {}
-    asm = rj.get("assembly") or {}
-    out.append("## 06 · PCB Fabrication & Assembly Detail")
-    out.append("**A · PCB Fabrication — PCBWay**")
-    out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
-        ["Base material", _mc(params.get("Material") or "FR-4")],
-        ["Layers", _mc(params.get("layers"))],
-        ["Dimensions", f"{_mc(params.get('Length'))} × {_mc(params.get('width'))} mm"],
-        ["Thickness", f"{_mc(params.get('Thickness'))} mm"],
-        ["Surface finish", _mc(params.get("surface"))],
-        ["Source", _mc(_tag_text(fab.get("tag"), fab.get("source")))],
-        ["**Fab cost / board**", f"**{fmt_inr(fab.get('selected_inr'))}**"],
-    ]))
-    out.append("**B · PCB Assembly — SMT + THT**")
-    out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
-        ["Total solder joints", _mc(asm.get("total_joints"))],
-        ["Setup fee (NRE)", fmt_inr(asm.get("setup_fee_inr"), 0)],
-        ["Stencil (NRE)", fmt_inr(asm.get("stencil_fee_inr"), 0)],
-        ["Rate per joint", fmt_inr(asm.get("rate_per_joint_inr"), 2)],
-        ["Source", _mc(_tag_text(asm.get("tag"), asm.get("source")))],
-        ["**Assembly / board (per-unit)**", f"**{fmt_inr(asm.get('per_unit_inr'))}**"],
-    ]))
+    if "fab_assembly" not in hidden:
+        fab = rj.get("fab") or {}
+        params = fab.get("params") or {}
+        asm = rj.get("assembly") or {}
+        out.append("## 06 · PCB Fabrication & Assembly Detail")
+        out.append("**A · PCB Fabrication — PCBWay**")
+        out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
+            ["Base material", _mc(params.get("Material") or "FR-4")],
+            ["Layers", _mc(params.get("layers"))],
+            ["Dimensions", f"{_mc(params.get('Length'))} × {_mc(params.get('width'))} mm"],
+            ["Thickness", f"{_mc(params.get('Thickness'))} mm"],
+            ["Surface finish", _mc(params.get("surface"))],
+            ["Source", _mc(_tag_text(fab.get("tag"), fab.get("source")))],
+            ["**Fab cost / board**", f"**{fmt_inr(fab.get('selected_inr'))}**"],
+        ]))
+        out.append("**B · PCB Assembly — SMT + THT**")
+        out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
+            ["Total solder joints", _mc(asm.get("total_joints"))],
+            ["Setup fee (NRE)", fmt_inr(asm.get("setup_fee_inr"), 0)],
+            ["Stencil (NRE)", fmt_inr(asm.get("stencil_fee_inr"), 0)],
+            ["Rate per joint", fmt_inr(asm.get("rate_per_joint_inr"), 2)],
+            ["Source", _mc(_tag_text(asm.get("tag"), asm.get("source")))],
+            ["**Assembly / board (per-unit)**", f"**{fmt_inr(asm.get('per_unit_inr'))}**"],
+        ]))
 
     # 07 Market Context
-    mc = rj.get("marketContext") or {}
-    out.append("## 07 · Market Context")
-    if mc.get("prose"):
-        out.append(str(mc["prose"]).strip())
-    comparables = mc.get("comparables") or []
-    if comparables:
-        out.append(_md_table(
-            ["Comparable", "Retail MRP", "Note"], ["---", "---:", "---"],
-            [[_mc(c.get("name")), fmt_inr(c.get("retail_mrp_inr"), 0), _mc(c.get("note"))] for c in comparables],
-        ))
-    if mc.get("margin_band"):
-        out.append(f"*Implied gross margin band: {mc['margin_band']} (approximate).*")
-    obs = mc.get("observations") or []
-    if obs:
-        out.append("**Sourcing & supply observations**\n" + "\n".join(f"- {o}" for o in obs))
+    if "market" not in hidden:
+        mc = rj.get("marketContext") or {}
+        out.append("## 07 · Market Context")
+        if mc.get("prose"):
+            out.append(str(mc["prose"]).strip())
+        comparables = mc.get("comparables") or []
+        if comparables:
+            out.append(_md_table(
+                ["Comparable", "Retail MRP", "Note"], ["---", "---:", "---"],
+                [[_mc(c.get("name")), fmt_inr(c.get("retail_mrp_inr"), 0), _mc(c.get("note"))] for c in comparables],
+            ))
+        if mc.get("margin_band"):
+            out.append(f"*Implied gross margin band: {mc['margin_band']} (approximate).*")
+        obs = mc.get("observations") or []
+        if obs:
+            out.append("**Sourcing & supply observations**\n" + "\n".join(f"- {o}" for o in obs))
 
     # 08 Methodology
-    out.append("## 08 · Methodology & Confidence")
-    out.append(_md_table(
-        ["Stage", "Data source", "Method", "Confidence"], ["---", "---", "---", "---"],
-        [[_mc(m.get("stage")), _mc(m.get("source")), _mc(m.get("method")), _mc(m.get("confidence"))]
-         for m in rj.get("methodology") or []],
-    ))
-    dq = rj.get("dataQuality") or []
-    if dq:
-        out.append("**Data quality notes**\n" + "\n".join(f"- {n}" for n in dq))
+    if "methodology" not in hidden:
+        out.append("## 08 · Methodology & Confidence")
+        out.append(_md_table(
+            ["Stage", "Data source", "Method", "Confidence"], ["---", "---", "---", "---"],
+            [[_mc(m.get("stage")), _mc(m.get("source")), _mc(m.get("method")), _mc(m.get("confidence"))]
+             for m in rj.get("methodology") or []],
+        ))
+        dq = rj.get("dataQuality") or []
+        if dq:
+            out.append("**Data quality notes**\n" + "\n".join(f"- {n}" for n in dq))
+
+    # Reference Images at the end (default placement).
+    if image_blocks and not img_after_exec:
+        out.extend(image_blocks)
 
     return "\n\n".join(out)
 
@@ -601,24 +667,38 @@ def render_html(report_json: dict[str, Any]) -> str:
     """Fill the locked template skeleton from the aggregated JSON."""
     rj = report_json or {}
     meta = rj.get("meta") or {}
-    body = "".join([
-        _cover(rj),
-        _executive(rj),
-        _product_overview(rj),
-        _architecture(rj),
-        _cost_by_stage(rj),
-        _bom(rj),
-        _fab_assembly(rj),
-        _market(rj),
-        _methodology(rj),
+    hidden = {str(s).lower() for s in (rj.get("hidden_sections") or [])}
+    images_html = _images(rj)
+    img_after_exec = _image_position(rj) == "after_executive"
+    sections = [
+        ("executive", _executive(rj)),
+        ("product_overview", _product_overview(rj)),
+        ("architecture", _architecture(rj)),
+        ("cost_by_stage", _cost_by_stage(rj)),
+        ("bom", _bom(rj)),
+        ("fab_assembly", _fab_assembly(rj)),
+        ("market", _market(rj)),
+        ("methodology", _methodology(rj)),
+    ]
+    parts = [_cover(rj)]
+    for key, section_html in sections:
+        if key in hidden:
+            continue
+        parts.append(section_html)
+        if key == "executive" and img_after_exec and images_html:
+            parts.append(images_html)
+    if images_html and not img_after_exec:
+        parts.append(images_html)
+    parts.append(
         """
   <footer>
     Generated by the Elecbits Teardown Cost Engine. Figures are estimates for internal planning and carry the
     confidence bands stated in Section 08. Live distributor pricing and FX are timestamped at generation and will
     drift over time. All amounts are single-unit landed costs in Indian Rupees (₹) unless otherwise noted; one-time
     NRE is shown separately. This document is not a vendor quotation and does not constitute a commercial offer.
-  </footer>""",
-    ])
+  </footer>"""
+    )
+    body = "".join(parts)
     return (
         "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
