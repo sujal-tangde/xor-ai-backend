@@ -371,9 +371,14 @@ def _generate_modification(
     """Edit the latest report for this conversation, operating on its saved JSON."""
     emit, writer = _make_emit()
     base = reports.latest_report_for_conversation(conversation_id) if conversation_id else None
+    # Reports belong to a project, not just one chat. If this conversation has no
+    # report of its own yet, fall back to the project's latest so the user can edit
+    # a report they generated in an earlier conversation.
+    if base is None or not base.get("report_json"):
+        base = reports.latest_report_for_project(project_id, user_id) or base
     if base is None or not base.get("report_json"):
         return (
-            "There's no existing report in this conversation to modify yet. "
+            "There's no existing report for this product yet. "
             "Ask me to generate a report first, then I can tweak it."
         )
 

@@ -13,13 +13,17 @@ e.g. "generate a report", "give me a should-cost report", "make a BOM cost PDF",
 "cost breakdown", "report this product's cost". Also use it when the user asks to
 **change/edit** a report you already produced in this conversation.
 
-There are two tools, and choosing the right one matters:
+There are three tools, and choosing the right one matters:
 
 - **`report_generation`** — create a NEW report from scratch.
 - **`report_edit`** — edit a report that ALREADY exists in this conversation,
   in place. Use this for every change to an existing report; it is much faster
   because it does not re-read the knowledge base, ask new questions, or re-price
   the whole BOM.
+- **`get_report`** — fetch an existing report from the database and re-display it
+  WITHOUT generating or changing anything. Use it when the user just wants to see
+  or re-open a report ("show me the report", "open my cost report", "pull the
+  report up again").
 
 ## How to generate a new report
 
@@ -59,6 +63,22 @@ Pass:
 
 If there is no report yet in this conversation, `report_edit` will say so — in
 that case call `report_generation` first to create one.
+
+## How to fetch / re-display an existing report
+
+Call the **`get_report`** tool when the user just wants to SEE a report that was
+already produced, not create or change one — e.g. "show me the report", "open the
+cost report", "can I see my report again?". It loads the saved report from the
+database and re-renders it in the preview panel with its download button; it does
+not recompute anything.
+
+Pass:
+- `report_id` (optional): only when the user references a specific report. Omit it
+  to fetch the most recent report for this conversation, falling back to the
+  latest report for the project.
+
+If no report exists for the product yet, `get_report` says so — then call
+`report_generation` to create one.
 
 When the user says "regenerate it" but only wants a tweak, prefer `report_edit`.
 Only use `report_generation` when they explicitly want the report rebuilt from

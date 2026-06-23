@@ -9,6 +9,9 @@ from src.agent.tools.report_tool import report_generation_tool
 from src.agent.tools.report_edit_tool import TOOL_LABEL as REPORT_EDIT_LABEL
 from src.agent.tools.report_edit_tool import TOOL_NAME as REPORT_EDIT_NAME
 from src.agent.tools.report_edit_tool import report_edit_tool
+from src.agent.tools.get_report_tool import TOOL_LABEL as GET_REPORT_LABEL
+from src.agent.tools.get_report_tool import TOOL_NAME as GET_REPORT_NAME
+from src.agent.tools.get_report_tool import get_report_tool
 from src.agent.tools.rag_tools import (
     SEARCH_FILE_CHUNKS_LABEL,
     SEARCH_FILE_CHUNKS_NAME,
@@ -42,6 +45,7 @@ TOOL_LABELS: dict[str, str] = {
     SEARCH_FILE_CHUNKS_NAME: SEARCH_FILE_CHUNKS_LABEL,
     REPORT_GENERATION_NAME: REPORT_GENERATION_LABEL,
     REPORT_EDIT_NAME: REPORT_EDIT_LABEL,
+    GET_REPORT_NAME: GET_REPORT_LABEL,
 }
 
 
@@ -56,6 +60,7 @@ def get_agent_tools() -> list:
         search_file_chunks,
         report_generation_tool,
         report_edit_tool,
+        get_report_tool,
     ]
     tavily = get_tavily_search_tool()
     if tavily:

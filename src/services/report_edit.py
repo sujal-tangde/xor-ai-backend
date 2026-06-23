@@ -63,6 +63,9 @@ fab_assembly | market | methodology
 embed an image in the report. Set "url" when the user PASTED an image URL/link in their message; otherwise leave it \
 null and the user's ATTACHED image(s) are used. Use position "after_executive" if they want it below the executive \
 summary, else "end". Emit whenever the user asks to attach/add/embed/include/insert an image, photo or picture.
+- {{"op": "remove_image", "match": "<optional caption/url substring, or null>"}}   remove an embedded image. \
+Emit whenever the user asks to remove/delete/get rid of an image, photo or picture (e.g. "remove the image below \
+the executive summary"). Leave "match" null to remove ALL images, or set it to part of a caption/URL to remove one.
 - {{"op": "set_volume", "volume": 5000}}                      target production volume
 - {{"op": "set_qty", "match": "<mpn/designator/text>", "qty": 3}}
 - {{"op": "remove_line", "match": "<mpn/designator/text>"}}
@@ -279,6 +282,23 @@ def apply_edit(
             )
             if added:
                 changes.append(f"attached {added} image(s)")
+
+        elif kind == "remove_image":
+            existing_images = report_json.get("images") or []
+            if existing_images:
+                match = str(op.get("match") or "").strip().lower()
+                if match:
+                    kept = [
+                        im for im in existing_images
+                        if match not in str(im.get("caption") or "").lower()
+                        and match not in str(im.get("url") or "").lower()
+                    ]
+                else:
+                    kept = []  # no match given → remove all images
+                removed = len(existing_images) - len(kept)
+                if removed:
+                    report_json["images"] = kept
+                    changes.append(f"removed {removed} image(s)")
 
         elif kind == "rewrite_prose":
             if _rewrite_prose(report_json, op.get("field", ""), op.get("instruction", request)):
