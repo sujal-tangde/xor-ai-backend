@@ -16,6 +16,7 @@ from src.core.config import (
     SUPABASE_SERVICE_KEY,
     SUPABASE_URL,
 )
+from src.core.retry import with_retry
 
 pillow_heif.register_heif_opener()
 
@@ -112,10 +113,13 @@ def _delete_derived_rows(client: Client, file_id: str) -> None:
 
 def _upload_bytes(bucket: str, path: str, data: bytes, content_type: str) -> str:
     client = get_supabase()
-    client.storage.from_(bucket).upload(
-        path,
-        data,
-        file_options={"content-type": content_type, "upsert": "true"},
+    with_retry(
+        lambda: client.storage.from_(bucket).upload(
+            path,
+            data,
+            file_options={"content-type": content_type, "upsert": "true"},
+        ),
+        f"Supabase storage upload ({bucket})",
     )
     return _public_url(bucket, path)
 
@@ -149,14 +153,17 @@ def upload_file(
     # file in place: we reuse its id so storage paths and any references stay
     # stable, overwrite the bytes, and purge the old chunks/insight so the file
     # is re-analyzed cleanly instead of leaving a duplicate behind.
-    existing = (
-        client.table("uploaded_files")
-        .select("id")
-        .eq("user_id", user_id)
-        .eq("project_id", project_id)
-        .eq("name", filename)
-        .limit(1)
-        .execute()
+    existing = with_retry(
+        lambda: (
+            client.table("uploaded_files")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+            .eq("name", filename)
+            .limit(1)
+            .execute()
+        ),
+        "Supabase file lookup",
     )
     replacing = bool(existing.data)
     file_id = existing.data[0]["id"] if replacing else str(uuid.uuid4())
@@ -197,15 +204,21 @@ def upload_file(
         # Drop the previous analysis before re-processing the replacement bytes.
         _delete_derived_rows(client, file_id)
         update_fields = {k: v for k, v in row.items() if k not in ("id", "user_id")}
-        result = (
-            client.table("uploaded_files")
-            .update(update_fields)
-            .eq("id", file_id)
-            .eq("user_id", user_id)
-            .execute()
+        result = with_retry(
+            lambda: (
+                client.table("uploaded_files")
+                .update(update_fields)
+                .eq("id", file_id)
+                .eq("user_id", user_id)
+                .execute()
+            ),
+            "Supabase metadata update",
         )
     else:
-        result = client.table("uploaded_files").insert(row).execute()
+        result = with_retry(
+            lambda: client.table("uploaded_files").insert(row).execute(),
+            "Supabase metadata insert",
+        )
     record = result.data[0] if result.data else row
 
     # Hand the heavy work to the RQ worker so the upload request returns fast.
