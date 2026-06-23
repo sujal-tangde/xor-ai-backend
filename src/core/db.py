@@ -193,6 +193,71 @@ ALTER TABLE reports ADD COLUMN IF NOT EXISTS html TEXT;
 ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_path TEXT;
 ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_url TEXT;
 ALTER TABLE reports DROP COLUMN IF EXISTS pdf_base64;
+
+-- Indexes on FK child columns (Postgres does NOT auto-index referencing
+-- columns; these speed up joins and make ON DELETE CASCADE lookups cheap).
+CREATE INDEX IF NOT EXISTS idx_project_insights_file_id ON project_insights(file_id);
+CREATE INDEX IF NOT EXISTS idx_report_questions_report_id ON report_questions(report_id);
+CREATE INDEX IF NOT EXISTS idx_reports_user_id ON reports(user_id);
+
+-- Referential integrity. These tables predate FK enforcement, so the
+-- constraints are added idempotently (keyed by our explicit names) and as
+-- NOT VALID: integrity is enforced on every new INSERT/UPDATE without a
+-- blocking scan of legacy rows, so this can never abort app startup. A
+-- tolerant VALIDATE pass below promotes the clean ones to fully validated.
+--
+-- NOTE: user_id columns intentionally have NO FK — they reference Supabase
+-- `auth.users`, which lives in the auth schema and is managed by Supabase.
+DO $$
+DECLARE
+    fk RECORD;
+BEGIN
+    FOR fk IN
+        SELECT * FROM (VALUES
+            ('uploaded_files',         'fk_uploaded_files_project',     'project_id',      'projects',      'CASCADE'),
+            ('image_chunks',           'fk_image_chunks_project',       'project_id',      'projects',      'CASCADE'),
+            ('image_chunks',           'fk_image_chunks_file',          'file_id',         'uploaded_files','CASCADE'),
+            ('file_chunks',            'fk_file_chunks_project',        'project_id',      'projects',      'CASCADE'),
+            ('file_chunks',            'fk_file_chunks_file',           'file_id',         'uploaded_files','CASCADE'),
+            ('project_insights',       'fk_project_insights_project',   'project_id',      'projects',      'CASCADE'),
+            ('project_insights',       'fk_project_insights_file',      'file_id',         'uploaded_files','CASCADE'),
+            ('project_knowledge_base', 'fk_pkb_project',                'project_id',      'projects',      'CASCADE'),
+            ('reports',                'fk_reports_project',            'project_id',      'projects',      'CASCADE'),
+            ('reports',                'fk_reports_conversation',       'conversation_id', 'conversations', 'SET NULL'),
+            ('report_questions',       'fk_report_questions_project',   'project_id',      'projects',      'CASCADE'),
+            ('report_questions',       'fk_report_questions_conversation','conversation_id','conversations','SET NULL'),
+            ('report_questions',       'fk_report_questions_report',    'report_id',       'reports',       'CASCADE')
+        ) AS t(tbl, conname, col, reftbl, ondelete)
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = fk.conname) THEN
+            EXECUTE format(
+                'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) '
+                'REFERENCES %I(id) ON DELETE %s NOT VALID',
+                fk.tbl, fk.conname, fk.col, fk.reftbl, fk.ondelete
+            );
+        END IF;
+    END LOOP;
+END $$;
+
+-- Promote each NOT VALID foreign key to validated where the data is clean;
+-- tables with legacy orphan rows simply stay NOT VALID (still enforced going
+-- forward) instead of aborting the migration.
+DO $$
+DECLARE
+    c RECORD;
+BEGIN
+    FOR c IN
+        SELECT conname, conrelid::regclass AS tbl
+        FROM pg_constraint
+        WHERE contype = 'f' AND NOT convalidated
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', c.tbl, c.conname);
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Leaving % NOT VALID (orphan rows present)', c.conname;
+        END;
+    END LOOP;
+END $$;
 """
 
 
