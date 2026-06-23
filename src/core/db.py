@@ -126,7 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_project_knowledge_base_project_id
 -- Generated should-cost reports. The aggregated structured JSON (report_json)
 -- is the source of truth for edits; the rendered PDF lives in the `reports`
 -- storage bucket (pdf_path/pdf_url), and `html` backs the live preview panel.
--- Legacy markdown/costs/pdf_base64 columns are kept nullable for back-compat.
+-- Legacy markdown/costs columns are kept nullable for back-compat.
 CREATE TABLE IF NOT EXISTS reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL,
@@ -140,7 +140,6 @@ CREATE TABLE IF NOT EXISTS reports (
     pdf_url TEXT,
     markdown TEXT,
     costs JSONB,
-    pdf_base64 TEXT,
     status TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -188,12 +187,12 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS report JSONB;
 
 -- Should-cost reports: store the aggregated structured JSON + rendered HTML, and
 -- the PDF in the `reports` storage bucket (path/URL only). The old inline base64
--- column is retired (kept nullable for back-compat; no longer written to).
+-- column is dropped — the PDF is only ever served from the bucket now.
 ALTER TABLE reports ADD COLUMN IF NOT EXISTS report_json JSONB;
 ALTER TABLE reports ADD COLUMN IF NOT EXISTS html TEXT;
 ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_path TEXT;
 ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_url TEXT;
-ALTER TABLE reports ALTER COLUMN pdf_base64 DROP NOT NULL;
+ALTER TABLE reports DROP COLUMN IF EXISTS pdf_base64;
 """
 
 
