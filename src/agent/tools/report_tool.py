@@ -89,13 +89,13 @@ def _writer():
         return lambda _payload: None
 
 
-def _make_emit():
-    """Capture the stream writer once (in the node context) and return an emit fn.
+def _emit_for_writer(writer):
+    """Build an ``emit(stage, status, message, meta)`` bound to ``writer``.
 
-    The returned ``emit`` is safe to call from worker threads (it closes over the
-    captured writer rather than re-reading a contextvar that wouldn't propagate).
+    Split out from :func:`_make_emit` so a non-LangGraph caller (the direct
+    report-edit fast path in ``chat_agent``) can supply its own writer and still
+    stream identical ``report_progress`` events.
     """
-    writer = _writer()
 
     def emit(stage: str, status: str, message: str, meta: dict[str, Any] | None = None) -> None:
         start, end = _STAGE_RANGE.get(stage, (0.0, 1.0))
@@ -121,7 +121,17 @@ def _make_emit():
         except Exception:  # pragma: no cover - streaming best-effort
             pass
 
-    return emit, writer
+    return emit
+
+
+def _make_emit():
+    """Capture the LangGraph stream writer once (in the node context) + an emit fn.
+
+    The returned ``emit`` is safe to call from worker threads (it closes over the
+    captured writer rather than re-reading a contextvar that wouldn't propagate).
+    """
+    writer = _writer()
+    return _emit_for_writer(writer), writer
 
 
 def _cfg(config: RunnableConfig | None) -> dict[str, Any]:
@@ -367,9 +377,18 @@ def _generate_modification(
     request: str,
     modification_request: str,
     file_ids: list[str] | None = None,
+    *,
+    emit=None,
+    writer=None,
 ) -> str:
-    """Edit the latest report for this conversation, operating on its saved JSON."""
-    emit, writer = _make_emit()
+    """Edit the latest report for this conversation, operating on its saved JSON.
+
+    ``emit``/``writer`` may be injected by a non-LangGraph caller (the direct
+    report-edit fast path); when omitted they are sourced from the LangGraph
+    stream writer as usual.
+    """
+    if emit is None or writer is None:
+        emit, writer = _make_emit()
     base = reports.latest_report_for_conversation(conversation_id) if conversation_id else None
     # Reports belong to a project, not just one chat. If this conversation has no
     # report of its own yet, fall back to the project's latest so the user can edit
@@ -412,6 +431,21 @@ def _generate_modification(
             summary = (summary + f"; attached {added} image(s)").strip("; ")
 
     images_added = len(report_json.get("images") or []) - images_before
+
+    # Nothing actually changed (no data/prose edit applied, no image attached).
+    # Report this honestly instead of re-rendering and claiming success — claiming
+    # a change that didn't happen is what drives the "I updated it" / "no it's the
+    # same" loop. Don't stream report_ready, so the UI doesn't imply a new version.
+    if not summary and images_added <= 0:
+        emit("rendering", "done", "No change applied.")
+        return (
+            "I wasn't able to apply that change to the report — I couldn't map the "
+            f'request ("{request.strip()}") to a concrete edit, so the report is '
+            "unchanged. Could you say exactly which part to change and the target "
+            "value? For example: \"set the PCB assembly cost to ₹90\", \"rename the "
+            "report to X\", \"remove the LED line\", or \"use 5,000 units\". "
+            "Do NOT tell the user the report was updated — it was not."
+        )
 
     title = (report_json.get("meta") or {}).get("title") or base.get("title") or "Should-Cost Report"
     volume = (report_json.get("meta") or {}).get("volume") or base.get("volume") or REPORT_DEFAULT_VOLUME

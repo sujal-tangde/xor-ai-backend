@@ -1,7 +1,10 @@
 """Chat agent for XOR Chat: Bedrock LLM + Tavily search, streamed token-by-token."""
 
+import asyncio
 import json
+import logging
 import re
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from datetime import date
@@ -22,6 +25,13 @@ from src.core.config import (
     LLM_API_KEY,
     LLM_MODEL,
 )
+
+logger = logging.getLogger(__name__)
+
+# Tool names that actually create or modify a report. Used by the
+# anti-fabrication backstop to tell a real report action from the model merely
+# claiming one.
+_REPORT_TOOL_NAMES = {"report_generation", "report_edit"}
 
 StreamEventType = Literal[
     "delta", "reset", "tool_start", "tool_end", "tool_query", "tools_used",
@@ -92,6 +102,106 @@ _COMMAND_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+# --------------------------------------------------------------------------- #
+# Report-intent detection (deterministic).
+#
+# The model intermittently REPLIES that it generated/edited a report without ever
+# calling a tool — nothing actually changes, but the user is told it did. We can't
+# rely on the prompt to stop this. Instead we (1) detect a clear report request in
+# code, (2) force the tool with a directive, and (3) back it up with a guard that
+# refuses to let a "done" claim through when no report tool ran.
+# --------------------------------------------------------------------------- #
+
+# Imperative verbs that, with a report/field cue, mean "edit the existing report".
+_EDIT_VERB_RE = re.compile(
+    r"\b(?:rename|re-?title|reword|re-?write|re-?price|re-?order|shorten|lengthen|"
+    r"expand|hide|unhide|embed|change|set|update|edit|modify|revise|adjust|remove|"
+    r"delete|drop|add|attach|insert|replace|use|put|increase|decrease|lower|raise|"
+    r"swap|correct|fix|round|make)\b",
+    re.IGNORECASE,
+)
+# A report/field the edit could target — guards the broad verbs above so a generic
+# imperative ("update me", "set a reminder") doesn't get mistaken for a report edit.
+_EDIT_CUE_RE = re.compile(
+    r"\b(?:report|title|sub-?title|section|heading|pdf|summary|executive|overview|"
+    r"architecture|methodology|bom|bill of materials|line|lines|price|priced|"
+    r"pricing|cost|costing|qty|quantity|volume|unit|units|component|components|"
+    r"part|parts|assembly|fab|fabrication|enclosure|firmware|image|images|photo|"
+    r"picture|mcu|ic|resistor|capacitor|connector|led|rate|column|row|landed|duty|"
+    r"margin|market)\b",
+    re.IGNORECASE,
+)
+# Verbs that, with a "report" noun, mean "build a NEW report from scratch".
+_GENERATE_REPORT_RE = re.compile(
+    r"\b(?:generate|re-?generate|create|re-?create|build|re-?build|produce|prepare|"
+    r"draft|make|give me|need|want|do)\b[^?]*?\b(?:should.?cost\s+report|"
+    r"cost\s+report|bom\s+report|cost\s+breakdown|cost\s+pdf|report)\b",
+    re.IGNORECASE,
+)
+# A reply that CLAIMS a report was produced/changed — what the model says when it
+# fabricates success. Matched only to catch fabrication when no tool ran.
+_CLAIMS_REPORT_RE = re.compile(
+    r"(?:"
+    r"\b(?:generated|created|built|made|produced|updated|edited|revised|changed|"
+    r"renamed|re-?titled|modified|adjusted|removed|added|attached|set|applied|done)\b"
+    r"[^.\n]{0,60}\b(?:report|pdf|title|section|bom|version|change|chang)"
+    r"|\b(?:report|pdf)\b[^.\n]{0,40}\b(?:is|has been|now)\b[^.\n]{0,20}"
+    r"\b(?:ready|updated|generated|created|done|available|titled|renamed)"
+    r"|\bnow\s+titled\b"
+    r"|^\s*(?:done|all done|sure thing)[!.\s]"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_report_edit_command(text: str) -> bool:
+    """True for a clear imperative request to EDIT the existing report."""
+    t = (text or "").strip()
+    if not t or t.endswith("?"):
+        return False
+    if _GENERATE_REPORT_RE.search(t):
+        return False  # a NEW-report request, not an edit
+    # An unambiguous title rename is enough on its own.
+    from src.services.report_edit import _detect_title_rename
+
+    if _detect_title_rename(t):
+        return True
+    return bool(_EDIT_VERB_RE.search(t) and _EDIT_CUE_RE.search(t))
+
+
+def _is_report_generate_command(text: str) -> bool:
+    """True for a clear request to GENERATE a new report."""
+    t = (text or "").strip()
+    if not t or t.endswith("?"):
+        return False
+    return bool(_GENERATE_REPORT_RE.search(t))
+
+
+def _claims_report_action(reply: str) -> bool:
+    """True when the reply asserts a report was generated/edited (success claim)."""
+    return bool(_CLAIMS_REPORT_RE.search(reply or ""))
+
+
+def _force_tool_directive(*, edit: bool, generate: bool) -> str:
+    """A directive appended to the user turn so the model must run the tool."""
+    if generate and not edit:
+        which = "the `report_generation` tool"
+        what = "generate the report"
+    elif edit and not generate:
+        which = "the `report_edit` tool"
+        what = "edit the existing report"
+    else:
+        which = "the `report_generation` or `report_edit` tool"
+        what = "create or change the report"
+    return (
+        f"\n\n[SYSTEM DIRECTIVE: This message requires you to {what}. You MUST call "
+        f"{which} to carry it out, and you must do so BEFORE writing any reply. Do "
+        "NOT say the report was generated, updated, renamed, changed, or is "
+        "ready/available unless that tool has actually run and returned a result "
+        "this turn. Replying with a success message without calling the tool is a "
+        "failure.]"
+    )
 
 
 def _system_prompt() -> str:
@@ -389,6 +499,104 @@ async def _direct_chat_stream(
             yield {"type": "delta", "text": delta}
 
 
+async def _run_direct_edit(
+    request: str,
+    project_id: str | None,
+    user_id: str | None,
+    conversation_id: str | None,
+    file_ids: list[str] | None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Run ``report_edit`` directly (no LLM) and stream its UI events.
+
+    Used as the backstop when the agent claimed an edit but never called the tool.
+    The synchronous edit runs in a worker thread; its progress/ready events are
+    bridged back to this async generator through a thread-safe queue. The tool's
+    own (truthful) return text is streamed as the assistant reply — so the user
+    sees exactly what changed, or an honest "couldn't apply that".
+    """
+    from src.agent.tools.report_tool import _emit_for_writer, _generate_modification
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    done = object()
+    result: dict[str, Any] = {}
+
+    def writer(payload: Any) -> None:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, payload)
+        except RuntimeError:  # loop closed — nothing to deliver to
+            pass
+
+    emit = _emit_for_writer(writer)
+
+    def run() -> None:
+        try:
+            result["text"] = _generate_modification(
+                str(project_id), conversation_id, user_id, request, request,
+                file_ids=file_ids, emit=emit, writer=writer,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            result["error"] = exc
+            logger.warning("Direct report edit failed", exc_info=True)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, done)
+
+    yield {"type": "tool_start", "tool": "report_edit", "label": tool_label("report_edit")}
+    threading.Thread(target=run, name="direct-report-edit", daemon=True).start()
+
+    while True:
+        payload = await queue.get()
+        if payload is done:
+            break
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("kind")
+        if kind == "report_progress":
+            yield {
+                "type": "report_progress",
+                "stage": payload.get("stage", ""),
+                "status": payload.get("status", "in_progress"),
+                "message": payload.get("message", ""),
+                "progress": payload.get("progress"),
+                "meta": payload.get("meta", {}),
+            }
+        elif kind == "report_ready":
+            yield {
+                "type": "report_ready",
+                "report_id": payload.get("report_id"),
+                "title": payload.get("title"),
+                "html": payload.get("html"),
+                "pdf_url": payload.get("pdf_url"),
+                "markdown": payload.get("markdown"),
+                "volume": payload.get("volume"),
+                "fx_rate": payload.get("fx_rate"),
+            }
+
+    yield {"type": "tool_end", "tool": "report_edit", "label": tool_label("report_edit")}
+
+    if result.get("error") is not None:
+        yield {
+            "type": "delta",
+            "text": (
+                "Sorry — something went wrong while editing the report. Nothing was "
+                "changed. Please try that again."
+            ),
+        }
+        return
+
+    text = (result.get("text") or "").strip()
+    if text:
+        yield {"type": "delta", "text": text}
+    yield {
+        "type": "tools_used",
+        "tools": [{
+            "tool": "report_edit",
+            "label": tool_label("report_edit"),
+            "query": request[:120],
+        }],
+    }
+
+
 def _agent_config(
     thread_id: str,
     project_id: str | None,
@@ -608,13 +816,25 @@ async def chat_stream(
             yield event
         return
 
-    thread_id = str(uuid.uuid4())
     latest = _latest_user_turn(messages)
+    latest_text = str(latest.get("content", "")) if latest else ""
     latest_file_ids = (
         [str(fid) for fid in latest.get("file_ids")]
         if latest and latest.get("file_ids")
         else []
     )
+
+    # Deterministic report-intent detection. When the user clearly asks to build or
+    # change a report we (1) force the model to call the tool and (2) refuse to let
+    # a fabricated "done" through if it doesn't (see the backstop below).
+    edit_intent = _is_report_edit_command(latest_text)
+    generate_intent = _is_report_generate_command(latest_text)
+    report_intent = edit_intent or generate_intent
+    if report_intent and lc_messages and isinstance(lc_messages[-1], HumanMessage):
+        directive = _force_tool_directive(edit=edit_intent, generate=generate_intent)
+        lc_messages[-1] = HumanMessage(content=lc_messages[-1].content + directive)
+
+    thread_id = str(uuid.uuid4())
     config = _agent_config(
         thread_id, project_id, user_id, conversation_id, file_ids=latest_file_ids
     )
@@ -623,8 +843,53 @@ async def chat_stream(
     if skill_files:
         # StateBackend reads skills from the `files` channel (see SkillsMiddleware).
         agent_input["files"] = dict(skill_files)
+
+    report_tool_ran = False
+    paused_for_questions = False
+    reply_parts: list[str] = []
     async for event in _stream_agent_events(agent_input, config, thread_id):
+        etype = event.get("type")
+        if etype == "delta":
+            reply_parts.append(event.get("text", ""))
+        elif etype == "reset":
+            reply_parts.clear()
+        elif etype == "tools_used":
+            if any(t.get("tool") in _REPORT_TOOL_NAMES for t in event.get("tools", [])):
+                report_tool_ran = True
+        elif etype == "questions":
+            # HILT — a report tool is actively running and will resume later.
+            paused_for_questions = True
+            report_tool_ran = True
         yield event
+
+    # ---- Anti-fabrication backstop ----------------------------------------- #
+    # The user asked for a report action but NO report tool ran. If the model
+    # nonetheless claimed success (or said nothing), don't let that stand: clear
+    # the fabricated text and actually do the work (edits) or own up (generation).
+    if report_intent and not report_tool_ran and not paused_for_questions:
+        reply = "".join(reply_parts)
+        if not reply.strip() or _claims_report_action(reply):
+            logger.info(
+                "Anti-fabrication backstop engaged (edit=%s generate=%s): model "
+                "claimed a report action without calling a tool.",
+                edit_intent, generate_intent,
+            )
+            yield {"type": "reset"}
+            if edit_intent and project_id:
+                async for event in _run_direct_edit(
+                    latest_text, project_id, user_id, conversation_id, latest_file_ids
+                ):
+                    yield event
+            else:
+                yield {
+                    "type": "delta",
+                    "text": (
+                        "I didn't actually generate the report — no report was "
+                        "created, despite what I may have said. Tell me to go ahead "
+                        "and I'll run the report generator now (I may ask a couple of "
+                        "quick questions first)."
+                    ),
+                }
 
 
 async def resume_stream(
