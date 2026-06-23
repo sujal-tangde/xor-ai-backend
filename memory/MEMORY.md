@@ -1,0 +1,1 @@
+- [Report edit honesty contract](report-edit-honesty-contract.md) — report_edit must only claim changes that actually applied; classifier vocab must cover the edit

@@ -89,13 +89,13 @@ def _writer():
         return lambda _payload: None
 
 
-def _make_emit():
-    """Capture the stream writer once (in the node context) and return an emit fn.
+def _emit_for_writer(writer):
+    """Build an ``emit(stage, status, message, meta)`` bound to ``writer``.
 
-    The returned ``emit`` is safe to call from worker threads (it closes over the
-    captured writer rather than re-reading a contextvar that wouldn't propagate).
+    Split out from :func:`_make_emit` so a non-LangGraph caller (the direct
+    report-edit fast path in ``chat_agent``) can supply its own writer and still
+    stream identical ``report_progress`` events.
     """
-    writer = _writer()
 
     def emit(stage: str, status: str, message: str, meta: dict[str, Any] | None = None) -> None:
         start, end = _STAGE_RANGE.get(stage, (0.0, 1.0))
@@ -121,7 +121,17 @@ def _make_emit():
         except Exception:  # pragma: no cover - streaming best-effort
             pass
 
-    return emit, writer
+    return emit
+
+
+def _make_emit():
+    """Capture the LangGraph stream writer once (in the node context) + an emit fn.
+
+    The returned ``emit`` is safe to call from worker threads (it closes over the
+    captured writer rather than re-reading a contextvar that wouldn't propagate).
+    """
+    writer = _writer()
+    return _emit_for_writer(writer), writer
 
 
 def _cfg(config: RunnableConfig | None) -> dict[str, Any]:
@@ -326,18 +336,68 @@ def _render_store_stream(
     return report_id
 
 
+def _resolve_image_refs(file_ids: list[str] | None) -> list[dict[str, Any]]:
+    """Resolve attached image file IDs into ``[{"url","name"}]`` references."""
+    if not file_ids:
+        return []
+    try:
+        from src.services.file_storage import get_image_refs_by_ids
+
+        return get_image_refs_by_ids([str(fid) for fid in file_ids])
+    except Exception:
+        logger.warning("Failed to resolve attached images for the report", exc_info=True)
+        return []
+
+
+# Lenient: the user attached an image and referred to it ("this image", "the
+# photo", "attach it below the summary"). We don't depend on the model's
+# paraphrase being precise — any image noun or attach verb is enough.
+_IMAGE_INTENT_RE = re.compile(
+    r"\b(?:image|images|photo|photos|picture|pictures|pic|pics|screenshot|figure|"
+    r"\.heic|\.jpe?g|\.png)\b|\b(?:attach|embed|insert)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_image_attached(*texts: str | None) -> bool:
+    return any(t and _IMAGE_INTENT_RE.search(t) for t in texts)
+
+
+def _image_position_from_text(*texts: str | None) -> str:
+    blob = " ".join(t for t in texts if t).lower()
+    if "executive" in blob or "summary" in blob:
+        return "after_executive"
+    return "end"
+
+
 def _generate_modification(
     project_id: str,
     conversation_id: str | None,
     user_id: str | None,
+    request: str,
     modification_request: str,
+    file_ids: list[str] | None = None,
+    *,
+    emit=None,
+    writer=None,
 ) -> str:
-    """Edit the latest report for this conversation, operating on its saved JSON."""
-    emit, writer = _make_emit()
+    """Edit the latest report for this conversation, operating on its saved JSON.
+
+    ``emit``/``writer`` may be injected by a non-LangGraph caller (the direct
+    report-edit fast path); when omitted they are sourced from the LangGraph
+    stream writer as usual.
+    """
+    if emit is None or writer is None:
+        emit, writer = _make_emit()
     base = reports.latest_report_for_conversation(conversation_id) if conversation_id else None
+    # Reports belong to a project, not just one chat. If this conversation has no
+    # report of its own yet, fall back to the project's latest so the user can edit
+    # a report they generated in an earlier conversation.
+    if base is None or not base.get("report_json"):
+        base = reports.latest_report_for_project(project_id, user_id) or base
     if base is None or not base.get("report_json"):
         return (
-            "There's no existing report in this conversation to modify yet. "
+            "There's no existing report for this product yet. "
             "Ask me to generate a report first, then I can tweak it."
         )
 
@@ -348,10 +408,46 @@ def _generate_modification(
         except json.JSONDecodeError:
             return "The saved report couldn't be read for editing — please regenerate it."
 
-    emit("rendering", "started", "Applying your requested changes…")
-    report_json, summary = report_edit.apply_edit(report_json, modification_request, emit)
+    image_refs = _resolve_image_refs(file_ids)
+    images_before = len(report_json.get("images") or [])
 
-    title = base.get("title") or (report_json.get("meta") or {}).get("title") or "Should-Cost Report"
+    emit("rendering", "started", "Applying your requested changes…")
+    report_json, summary = report_edit.apply_edit(
+        report_json, modification_request, emit, image_refs=image_refs,
+    )
+
+    # Fallback: if the user attached an image and clearly wants it embedded but the
+    # edit classifier didn't emit an add_image op, attach it here. Intent is read
+    # from the VERBATIM request too — the model's paraphrase often drops it.
+    image_intended = _wants_image_attached(request, modification_request)
+    if (
+        image_refs
+        and len(report_json.get("images") or []) == images_before
+        and image_intended
+    ):
+        position = _image_position_from_text(request, modification_request)
+        added = report_edit._add_images(report_json, image_refs, position, None)
+        if added:
+            summary = (summary + f"; attached {added} image(s)").strip("; ")
+
+    images_added = len(report_json.get("images") or []) - images_before
+
+    # Nothing actually changed (no data/prose edit applied, no image attached).
+    # Report this honestly instead of re-rendering and claiming success — claiming
+    # a change that didn't happen is what drives the "I updated it" / "no it's the
+    # same" loop. Don't stream report_ready, so the UI doesn't imply a new version.
+    if not summary and images_added <= 0:
+        emit("rendering", "done", "No change applied.")
+        return (
+            "I wasn't able to apply that change to the report — I couldn't map the "
+            f'request ("{request.strip()}") to a concrete edit, so the report is '
+            "unchanged. Could you say exactly which part to change and the target "
+            "value? For example: \"set the PCB assembly cost to ₹90\", \"rename the "
+            "report to X\", \"remove the LED line\", or \"use 5,000 units\". "
+            "Do NOT tell the user the report was updated — it was not."
+        )
+
+    title = (report_json.get("meta") or {}).get("title") or base.get("title") or "Should-Cost Report"
     volume = (report_json.get("meta") or {}).get("volume") or base.get("volume") or REPORT_DEFAULT_VOLUME
 
     _render_store_stream(
@@ -365,9 +461,22 @@ def _generate_modification(
         writer=writer,
         existing_report_id=base["id"],
     )
+
+    # Honest note about the image outcome so the assistant doesn't claim an attach
+    # that didn't happen.
+    image_note = ""
+    if image_intended and images_added <= 0:
+        if not image_refs:
+            image_note = (
+                " NOTE: I could not embed an image because no image file was attached to this "
+                "message (or it wasn't an image). Tell the user to attach the image to their "
+                "message and ask again — do NOT claim the image was added."
+            )
+        else:
+            image_note = " NOTE: the image could not be embedded — do NOT claim it was added."
     return (
         f'Updated the report — {summary}. The revised version is shown on the right and the PDF is '
-        "ready to download. Let me know if you'd like any other changes."
+        f"ready to download. Let me know if you'd like any other changes.{image_note}"
     )
 
 
@@ -376,8 +485,9 @@ def report_generation_tool(
     request: str,
     config: RunnableConfig = None,  # type: ignore[assignment]
     modification_request: str | None = None,
+    file_ids: list[str] | None = None,
 ) -> str:
-    """Generate (or modify) a professional should-cost PDF report for the product.
+    """Generate a NEW professional should-cost PDF report for the product.
 
     Call this whenever the user asks to generate a report, a should-cost report,
     a BOM cost report, a cost breakdown PDF, or similar. It reads the project's
@@ -385,18 +495,32 @@ def report_generation_tool(
     (Mouser), quotes the PCB (PCBWay), applies duty and assembly costs across a
     volume curve, renders a PDF in the locked report format, and streams it.
 
+    To CHANGE a report that already exists in this conversation, use the dedicated
+    ``report_edit`` tool instead — it is much faster (no KB re-read, no new
+    questions, no full re-pricing). ``modification_request`` here is retained only
+    as a backward-compatible fallback that delegates to the same edit logic.
+
     Args:
         request: The user's request, verbatim (used to infer intent/volume).
-        modification_request: If the user is asking to CHANGE a report already
-            generated in this conversation (e.g. "change the target volume to
-            5000", "remove the LED line", "shorten the executive summary"), put
-            their change request here; the existing report is edited in place.
+        modification_request: DEPRECATED entry point — prefer the ``report_edit``
+            tool. If set (e.g. "change the target volume to 5000", "remove the LED
+            line", "shorten the executive summary"), the existing report is edited
+            in place via the same logic ``report_edit`` uses.
+        file_ids: The IDs of any images the user ATTACHED to this message that they
+            want embedded in the report. Pass the attached file IDs here whenever
+            the user asks to attach/add/embed an image or photo.
     """
     cfg = _cfg(config)
     project_id = cfg.get("project_id")
     user_id = cfg.get("user_id")
     conversation_id = cfg.get("conversation_id")
     thread_id = cfg.get("thread_id")
+    # Attached image IDs can arrive two ways: threaded through the request config
+    # (reliable, set by chat_stream) or passed by the model as a tool arg. Merge
+    # both so an attach works regardless of which path delivered them.
+    cfg_file_ids = [str(x) for x in (cfg.get("file_ids") or [])]
+    arg_file_ids = [str(x) for x in (file_ids or [])]
+    file_ids = list(dict.fromkeys(cfg_file_ids + arg_file_ids))
 
     if not project_id:
         return "No project is associated with this conversation, so I can't build a report."
@@ -406,7 +530,8 @@ def report_generation_tool(
     # ---- Edit path: revise the existing report instead of rebuilding. ------- #
     if modification_request and modification_request.strip():
         return _generate_modification(
-            str(project_id), conversation_id, user_id, modification_request.strip()
+            str(project_id), conversation_id, user_id,
+            request, modification_request.strip(), file_ids=file_ids,
         )
 
     emit, writer = _make_emit()
@@ -492,6 +617,14 @@ def report_generation_tool(
         "Figures are the recurring cost to build a single unit. One-time tooling, firmware "
         "and line-setup (NRE) is listed separately and is not included in the per-unit cost."
     )
+
+    # Embed any attached images when the user asked to include one in the report.
+    if file_ids and _wants_image_attached(request):
+        image_refs = _resolve_image_refs(file_ids)
+        if image_refs:
+            report_edit._add_images(
+                report_json, image_refs, _image_position_from_text(request), None
+            )
 
     # ---- Steps 10–11: render, store, stream --------------------------------- #
     title = report_json.get("meta", {}).get("title") or f"Should-Cost Report — {product_label}"

@@ -250,6 +250,22 @@ def latest_report_for_conversation(conversation_id: str) -> dict[str, Any] | Non
     return result.data[0] if result.data else None
 
 
+def latest_report_for_project(
+    project_id: str, user_id: str | None = None
+) -> dict[str, Any] | None:
+    """The most recent report for a project (across all of its conversations).
+
+    Used as a fallback when fetching "the report" from a conversation that has none
+    of its own yet — reports belong to a project, so a prior chat's report is still
+    the right one to surface. Scoped to ``user_id`` when given.
+    """
+    query = get_supabase().table("reports").select("*").eq("project_id", project_id)
+    if user_id is not None:
+        query = query.eq("user_id", user_id)
+    result = query.order("created_at", desc=True).limit(1).execute()
+    return result.data[0] if result.data else None
+
+
 # --------------------------------------------------------------------------- #
 # report_questions table
 # --------------------------------------------------------------------------- #
