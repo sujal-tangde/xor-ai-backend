@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 
 from redis import Redis
-from rq import Queue
+from rq import Queue, Retry
 
 from src.core.config import REDIS_URL
 
@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 QUEUE_NAME = "xor-processing"
 # Generous timeout: a document map/reduce can involve several LLM calls.
 JOB_TIMEOUT = 1800
+# Automatically retry a failed job with growing back-off instead of letting it
+# die in the failed registry. A KB recompute that hit a transient statement /
+# lock timeout (the cause of the historical processed-count drift) gets three
+# more chances before it's considered dead. Back-off is in seconds.
+DEFAULT_RETRY_INTERVALS = [30, 90, 300]
 
 _redis: Redis | None = None
 _queue: Queue | None = None
@@ -39,12 +44,19 @@ def get_queue() -> Queue:
     return _queue
 
 
-def _enqueue(func_path: str, *args) -> None:
+def _enqueue(func_path: str, *args, retry: bool = True) -> None:
     try:
-        get_queue().enqueue(func_path, *args, job_timeout=JOB_TIMEOUT)
+        retry_policy = (
+            Retry(max=len(DEFAULT_RETRY_INTERVALS), interval=DEFAULT_RETRY_INTERVALS)
+            if retry
+            else None
+        )
+        get_queue().enqueue(func_path, *args, job_timeout=JOB_TIMEOUT, retry=retry_policy)
     except Exception:
         # If Redis is down we don't want the upload request to fail; the file is
-        # already stored and can be reprocessed. Log and move on.
+        # already stored and can be reprocessed. Log and move on. The reconcile
+        # sweep (knowledge_base.reconcile_unprocessed_insights) is the backstop
+        # for an insight whose recompute was never enqueued because of this.
         logger.exception("Failed to enqueue %s", func_path)
 
 

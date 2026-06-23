@@ -41,7 +41,26 @@ def list_projects(user_id: str) -> list[dict[str, Any]]:
         .order("updated_at", desc=True)
         .execute()
     )
-    return result.data or []
+    projects = result.data or []
+    if not projects:
+        return projects
+
+    # Attach each project's insight counts so the sidebar badge has an initial
+    # value on load; live changes arrive over the websocket afterwards.
+    ids = [p["id"] for p in projects]
+    kb = (
+        get_supabase()
+        .table("project_knowledge_base")
+        .select("project_id, insights_total, insights_processed")
+        .in_("project_id", ids)
+        .execute()
+    )
+    counts = {row["project_id"]: row for row in (kb.data or [])}
+    for p in projects:
+        row = counts.get(p["id"])
+        p["insights_total"] = (row.get("insights_total") if row else 0) or 0
+        p["insights_processed"] = (row.get("insights_processed") if row else 0) or 0
+    return projects
 
 
 def get_project(user_id: str, project_id: str) -> dict[str, Any] | None:

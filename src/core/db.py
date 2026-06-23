@@ -194,6 +194,39 @@ ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_path TEXT;
 ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_url TEXT;
 ALTER TABLE reports DROP COLUMN IF EXISTS pdf_base64;
 
+-- Per-insight processing marker. `insights_processed` in project_knowledge_base
+-- used to be a blind +1 counter bumped by each recompute job; a job that died
+-- (e.g. a statement timeout on the per-project advisory lock) left the counter
+-- permanently behind, with no way to tell WHICH insight was missed. processed_at
+-- makes folding idempotent and self-healing: the recompute marks the row, the
+-- counter is derived as count(processed_at IS NOT NULL), and a reconcile sweep
+-- re-enqueues anything still NULL.
+ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
+-- Partial index keeps the "find unprocessed" reconcile sweep cheap.
+CREATE INDEX IF NOT EXISTS idx_project_insights_unprocessed
+    ON project_insights(project_id) WHERE processed_at IS NULL;
+
+-- One-time back-fill for rows that predate processed_at. Runs only for projects
+-- that have NO processed_at marks yet (so it never re-fires once the pipeline
+-- starts writing the column) and marks the OLDEST `insights_processed` rows per
+-- project as done — matching the legacy counter. Any remainder stays NULL and
+-- gets picked up by the reconcile sweep.
+WITH ranked AS (
+    SELECT pi.id,
+           row_number() OVER (PARTITION BY pi.project_id ORDER BY pi.created_at) AS rn,
+           kb.insights_processed AS proc
+    FROM project_insights pi
+    JOIN project_knowledge_base kb ON kb.project_id = pi.project_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM project_insights x
+        WHERE x.project_id = pi.project_id AND x.processed_at IS NOT NULL
+    )
+)
+UPDATE project_insights p
+SET processed_at = p.created_at
+FROM ranked r
+WHERE p.id = r.id AND r.rn <= r.proc;
+
 -- Indexes on FK child columns (Postgres does NOT auto-index referencing
 -- columns; these speed up joins and make ON DELETE CASCADE lookups cheap).
 CREATE INDEX IF NOT EXISTS idx_project_insights_file_id ON project_insights(file_id);

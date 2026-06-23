@@ -36,8 +36,27 @@ def _run_worker() -> None:
     worker.work()
 
 
+def _reconcile_on_boot() -> None:
+    """Re-enqueue any insight whose KB recompute was lost (crash / never queued).
+
+    Runs once in the parent process before workers start, so a previous run that
+    died mid-job — leaving the processed count behind — self-heals on restart
+    instead of staying stuck forever.
+    """
+    try:
+        from src.services.knowledge_base import reconcile_unprocessed_insights
+
+        n = reconcile_unprocessed_insights()
+        if n:
+            logger.info("Boot reconcile re-enqueued %d unprocessed insight(s)", n)
+    except Exception:
+        logger.exception("Boot reconcile failed (continuing to start workers)")
+
+
 def main() -> None:
     count = max(1, WORKER_COUNT)
+
+    _reconcile_on_boot()
 
     # Single worker: run in this process so logs and Ctrl-C are direct.
     if count == 1:
