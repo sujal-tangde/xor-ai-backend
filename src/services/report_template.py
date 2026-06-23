@@ -117,6 +117,19 @@ def _confidence_tag(level: str | None) -> str:
     return f'<span class="tag {cls}">{esc(text)}</span>'
 
 
+def _sec_title(rj: dict[str, Any], key: str, default: str) -> str:
+    """The heading text for a section.
+
+    Returns the user's per-section override from ``rj["section_titles"]`` (set via
+    an edit's ``set_section_title`` op) when present, else the locked default. Only
+    the heading TEXT is overridable — the section number and layout never change.
+    """
+    override = (rj.get("section_titles") or {}).get(key)
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    return default
+
+
 # --------------------------------------------------------------------------- #
 # Section builders
 # --------------------------------------------------------------------------- #
@@ -162,7 +175,7 @@ def _executive(rj: dict[str, Any]) -> str:
     return f"""
   <section>
     <div class="sec-no">01</div>
-    <div class="sec-h">Executive Summary</div>
+    <div class="sec-h">{esc(_sec_title(rj, "executive", "Executive Summary"))}</div>
     <p class="lead">{esc(product.get('summary_prose'))}</p>
     <div class="metrics">
       <div>
@@ -202,7 +215,7 @@ def _product_overview(rj: dict[str, Any]) -> str:
     return f"""
   <section>
     <div class="sec-no">02</div>
-    <div class="sec-h">Product Overview</div>
+    <div class="sec-h">{esc(_sec_title(rj, "product_overview", "Product Overview"))}</div>
     <div class="twocol">
       <div>
         <table class="kv">{kv_rows}</table>
@@ -233,7 +246,7 @@ def _architecture(rj: dict[str, Any]) -> str:
     return f"""
   <section>
     <div class="sec-no">03</div>
-    <div class="sec-h">Architecture Analysis</div>
+    <div class="sec-h">{esc(_sec_title(rj, "architecture", "Architecture Analysis"))}</div>
     <p class="lead">{esc(arch.get('prose'))}</p>
     <div class="arch">{blocks}</div>
     {insight_html}
@@ -263,7 +276,7 @@ def _cost_by_stage(rj: dict[str, Any]) -> str:
     return f"""
   <section>
     <div class="sec-no">04</div>
-    <div class="sec-h">Cost by Manufacturing Stage</div>
+    <div class="sec-h">{esc(_sec_title(rj, "cost_by_stage", "Cost by Manufacturing Stage"))}</div>
     <p class="lead">Recurring per-unit cost for a single unit, decomposed by standard manufacturing stage.
     One-time NRE (tooling, firmware, line setup) is reported separately and is not included here.
     Bars are proportional to contribution.</p>
@@ -296,7 +309,7 @@ def _bom(rj: dict[str, Any]) -> str:
     return f"""
   <section>
     <div class="sec-no">05</div>
-    <div class="sec-h">Bill of Materials</div>
+    <div class="sec-h">{esc(_sec_title(rj, "bom", "Bill of Materials"))}</div>
     <p class="lead">Reconstructed BOM with per-line landed cost. Unit pricing reflects the qty break at the
     selected volume, duty-loaded per HSN classification. Every line is tagged Live (distributor) or Est (estimate).</p>
     <table>
@@ -343,7 +356,7 @@ def _fab_assembly(rj: dict[str, Any]) -> str:
     return f"""
   <section>
     <div class="sec-no">06</div>
-    <div class="sec-h">PCB Fabrication &amp; Assembly Detail</div>
+    <div class="sec-h">{esc(_sec_title(rj, "fab_assembly", "PCB Fabrication & Assembly Detail"))}</div>
     <div class="twocol">
       <div>
         <p style="font-weight:700;color:var(--brand-2);margin-bottom:4px">A · PCB Fabrication — PCBWay</p>
@@ -382,7 +395,7 @@ def _market(rj: dict[str, Any]) -> str:
     return f"""
   <section>
     <div class="sec-no">07</div>
-    <div class="sec-h">Market Context</div>
+    <div class="sec-h">{esc(_sec_title(rj, "market", "Market Context"))}</div>
     <p class="lead">{esc(mc.get('prose'))}</p>
     <div class="twocol">
       <div>
@@ -413,7 +426,7 @@ def _methodology(rj: dict[str, Any]) -> str:
     return f"""
   <section style="border-bottom:none">
     <div class="sec-no">08</div>
-    <div class="sec-h">Methodology &amp; Confidence</div>
+    <div class="sec-h">{esc(_sec_title(rj, "methodology", "Methodology & Confidence"))}</div>
     <table>
       <thead><tr><th>Stage</th><th>Data source</th><th>Method</th><th>Confidence</th></tr></thead>
       <tbody>{rows}</tbody>
@@ -428,21 +441,16 @@ def _images(rj: dict[str, Any]) -> str:
         return ""
     cards = ""
     for img in images:
-        caption = (
-            f'<figcaption style="font-size:10.5px;color:var(--muted);margin-top:5px">'
-            f'{esc(img.get("caption"))}</figcaption>'
-        ) if img.get("caption") else ""
         cards += (
             f'<figure style="margin:0">'
             f'<img src="{esc(img.get("url"))}" alt="{esc(img.get("caption") or "attached image")}" '
             f'style="width:100%;border:1px solid var(--line);border-radius:4px"/>'
-            f"{caption}</figure>"
+            f"</figure>"
         )
+    # Images render as a bare block — no "Reference Images" heading and no
+    # boilerplate lead text — so attached photos appear cleanly on their own.
     return f"""
   <section>
-    <div class="sec-no">IMG</div>
-    <div class="sec-h">Reference Images</div>
-    <p class="lead">Images attached by the user for this report.</p>
     <div class="threecol" style="gap:18px">{cards}</div>
   </section>"""
 
@@ -484,13 +492,9 @@ def _md_images(rj: dict[str, Any]) -> list[str]:
     images = [img for img in (rj.get("images") or []) if isinstance(img, dict) and img.get("url")]
     if not images:
         return []
-    blocks = ["## Reference Images"]
-    for img in images:
-        caption = str(img.get("caption") or "attached image")
-        blocks.append(f"![{caption}]({img['url']})")
-        if img.get("caption"):
-            blocks.append(f"*{img['caption']}*")
-    return blocks
+    # Image-only: no "## Reference Images" heading and no caption line — just the
+    # image(s), so attached photos appear cleanly on their own.
+    return [f"![{str(img.get('caption') or 'attached image')}]({img['url']})" for img in images]
 
 
 def render_markdown(report_json: dict[str, Any]) -> str:
@@ -514,7 +518,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
 
     # 01 Executive Summary
     if "executive" not in hidden:
-        out.append("## 01 · Executive Summary")
+        out.append(f"## 01 · {_sec_title(rj, 'executive', 'Executive Summary')}")
         if product.get("summary_prose"):
             out.append(str(product["summary_prose"]).strip())
         bom_per_unit = (rj.get("bom") or {}).get("subtotal_inr")
@@ -539,7 +543,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
 
     # 02 Product Overview
     if "product_overview" not in hidden:
-        out.append("## 02 · Product Overview")
+        out.append(f"## 02 · {_sec_title(rj, 'product_overview', 'Product Overview')}")
         overview = product.get("overview") or []
         if overview:
             out.append(_md_table(
@@ -557,7 +561,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
     # 03 Architecture Analysis
     if "architecture" not in hidden:
         arch = rj.get("architecture") or {}
-        out.append("## 03 · Architecture Analysis")
+        out.append(f"## 03 · {_sec_title(rj, 'architecture', 'Architecture Analysis')}")
         if arch.get("prose"):
             out.append(str(arch["prose"]).strip())
         blocks = arch.get("blocks") or []
@@ -571,7 +575,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
     # 04 Cost by Manufacturing Stage
     if "cost_by_stage" not in hidden:
         stages = rj.get("stages") or {}
-        out.append("## 04 · Cost by Manufacturing Stage (1 unit, recurring)")
+        out.append(f"## 04 · {_sec_title(rj, 'cost_by_stage', 'Cost by Manufacturing Stage')} (1 unit, recurring)")
         stage_rows = [
             [_mc(r.get("stage")), f"{r.get('pct', 0):.0f}%", fmt_inr(r.get("amount"))]
             for r in stages.get("rows") or []
@@ -592,7 +596,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
             for r in bom.get("rows") or []
         ]
         bom_rows.append(["", "", "", "", "", "", "", "", "**Subtotal**", f"**{fmt_inr(bom.get('subtotal_inr'))}**", ""])
-        out.append("## 05 · Bill of Materials")
+        out.append(f"## 05 · {_sec_title(rj, 'bom', 'Bill of Materials')}")
         out.append(_md_table(
             ["S.No", "MPN", "Make", "Description", "Desig.", "Qty", "Pkg", "Unit ₹", "BCD/IGST", "Ext ₹", "Source"],
             ["---:", "---", "---", "---", "---", "---:", "---", "---:", "---", "---:", "---"],
@@ -605,7 +609,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
         fab = rj.get("fab") or {}
         params = fab.get("params") or {}
         asm = rj.get("assembly") or {}
-        out.append("## 06 · PCB Fabrication & Assembly Detail")
+        out.append(f"## 06 · {_sec_title(rj, 'fab_assembly', 'PCB Fabrication & Assembly Detail')}")
         out.append("**A · PCB Fabrication — PCBWay**")
         out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
             ["Base material", _mc(params.get("Material") or "FR-4")],
@@ -629,7 +633,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
     # 07 Market Context
     if "market" not in hidden:
         mc = rj.get("marketContext") or {}
-        out.append("## 07 · Market Context")
+        out.append(f"## 07 · {_sec_title(rj, 'market', 'Market Context')}")
         if mc.get("prose"):
             out.append(str(mc["prose"]).strip())
         comparables = mc.get("comparables") or []
@@ -646,7 +650,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
 
     # 08 Methodology
     if "methodology" not in hidden:
-        out.append("## 08 · Methodology & Confidence")
+        out.append(f"## 08 · {_sec_title(rj, 'methodology', 'Methodology & Confidence')}")
         out.append(_md_table(
             ["Stage", "Data source", "Method", "Confidence"], ["---", "---", "---", "---"],
             [[_mc(m.get("stage")), _mc(m.get("source")), _mc(m.get("method")), _mc(m.get("confidence"))]

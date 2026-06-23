@@ -448,7 +448,7 @@ def report_generation_tool(
     modification_request: str | None = None,
     file_ids: list[str] | None = None,
 ) -> str:
-    """Generate (or modify) a professional should-cost PDF report for the product.
+    """Generate a NEW professional should-cost PDF report for the product.
 
     Call this whenever the user asks to generate a report, a should-cost report,
     a BOM cost report, a cost breakdown PDF, or similar. It reads the project's
@@ -456,14 +456,17 @@ def report_generation_tool(
     (Mouser), quotes the PCB (PCBWay), applies duty and assembly costs across a
     volume curve, renders a PDF in the locked report format, and streams it.
 
+    To CHANGE a report that already exists in this conversation, use the dedicated
+    ``report_edit`` tool instead — it is much faster (no KB re-read, no new
+    questions, no full re-pricing). ``modification_request`` here is retained only
+    as a backward-compatible fallback that delegates to the same edit logic.
+
     Args:
         request: The user's request, verbatim (used to infer intent/volume).
-        modification_request: If the user is asking to CHANGE a report already
-            generated in this conversation (e.g. "change the target volume to
-            5000", "remove the LED line", "shorten the executive summary", "remove
-            the architecture section", "attach this image below the executive
-            summary"), put their change request here; the existing report is
-            edited in place.
+        modification_request: DEPRECATED entry point — prefer the ``report_edit``
+            tool. If set (e.g. "change the target volume to 5000", "remove the LED
+            line", "shorten the executive summary"), the existing report is edited
+            in place via the same logic ``report_edit`` uses.
         file_ids: The IDs of any images the user ATTACHED to this message that they
             want embedded in the report. Pass the attached file IDs here whenever
             the user asks to attach/add/embed an image or photo.

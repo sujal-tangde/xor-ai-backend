@@ -1,5 +1,6 @@
 {
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(./venv/Scripts/python.exe -c \"from src.main import app; print\\('OK:', app.title\\); print\\([r.path for r in app.routes if hasattr\\(r, 'path'\\)]\\)\")",
       "Bash(./venv/Scripts/python.exe -c \"import deepagents, inspect; print\\(deepagents.__version__ if hasattr\\(deepagents,'__version__'\\) else 'no ver'\\); print\\([n for n in dir\\(deepagents\\) if not n.startswith\\('_'\\)]\\)\")",
@@ -42,7 +43,11 @@
       "Bash(curl -s -L https://skzkvpkgajdvasrbvtdh.supabase.co/storage/v1/object/public/reports/8d223116-8148-4248-a743-082097d44407.pdf -o /tmp/r.pdf)",
       "Read(//tmp/**)",
       "Bash(rm /tmp/r.pdf)",
-      "Bash(node *)"
+      "Bash(node *)",
+      "Bash(xargs grep -l \"reports\")",
+      "PowerShell(python -c \"from src.agent.tools import get_agent_tools, TOOL_LABELS; tools=get_agent_tools\\(\\); print\\([t.name for t in tools]\\); print\\('report_edit' in TOOL_LABELS, TOOL_LABELS.get\\('report_edit'\\)\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import supabase; print\\('supabase present'\\)\" 2>&1; .\\\\.venv\\\\Scripts\\\\python.exe -c \"from src.agent.tools import get_agent_tools, TOOL_LABELS; print\\([t.name for t in get_agent_tools\\(\\)]\\); print\\('report_edit:', TOOL_LABELS.get\\('report_edit'\\)\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from src.agent.chat_agent import get_agent; a=get_agent\\(\\); print\\('agent built OK with report_edit'\\); from src.agent.tools.report_edit_tool import report_edit_tool; print\\('args:', list\\(report_edit_tool.args.keys\\(\\)\\)\\)\")"
     ]
   }
 }

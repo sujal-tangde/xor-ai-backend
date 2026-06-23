@@ -37,16 +37,32 @@ _PROSE_FIELDS = {
 }
 
 _CLASSIFY_PROMPT = """You are editing an existing electronics should-cost report. The user asked for a change. \
-Classify it into concrete operations against the report state below. Do NOT compute new numbers — only describe \
+Your job is to translate ANY edit request into one or more concrete operations against the report state below, \
+choosing the most specific operation(s) that capture the user's intent. Do NOT compute new numbers — only describe \
 WHAT to change; the system recomputes costs deterministically.
 
+Guiding rules:
+- Pick the MOST SPECIFIC operation. Renaming a SECTION's heading is NOT the same as renaming the whole report — \
+do not use set_title for a section heading, and do not use set_section_title for the report's overall title.
+- Emit MULTIPLE operations when the user asks for several changes in one message.
+- The report has a fixed set of sections (executive, product_overview, architecture, cost_by_stage, bom, \
+fab_assembly, market, methodology); you can rename their headings, hide them, rewrite their narrative text, or \
+edit their data, but you cannot invent brand-new section types.
+- If a request is narrative/wording for a section that has an editable prose field, use rewrite_prose. If it does \
+not map to any operation below, fall back to a rewrite_prose on the closest section so something reasonable happens.
+
 Operation types you may emit (in an "operations" array):
-- {{"op": "set_title", "title": "<new report title>"}}        rename the report / change its title
-- {{"op": "remove_section", "section": "architecture"}}       hide a whole section. section is one of: \
-executive | product_overview | architecture | cost_by_stage | bom | fab_assembly | market | methodology
-- {{"op": "add_image", "position": "after_executive", "caption": "<optional caption>"}}   embed the user's \
-ATTACHED image(s) in the report. Use position "after_executive" if they want it below the executive summary, \
-else "end". Emit this whenever the user asks to attach/add/embed/include/insert an image or photo.
+- {{"op": "set_title", "title": "<new report title>"}}        rename the WHOLE report (the cover/document title only)
+- {{"op": "set_section_title", "section": "methodology", "title": "<new heading>"}}   rename ONE section's HEADING \
+text (e.g. the user says: change section "08 · Methodology & Confidence" to "08 · Myth & Confi" → \
+{{"op":"set_section_title","section":"methodology","title":"Myth & Confi"}}; give ONLY the heading words, never the \
+leading number). section is one of: executive | product_overview | architecture | cost_by_stage | bom | \
+fab_assembly | market | methodology
+- {{"op": "remove_section", "section": "architecture"}}       hide a whole section. section is one of the keys above
+- {{"op": "add_image", "position": "after_executive", "caption": "<optional caption>", "url": "<image URL or null>"}}   \
+embed an image in the report. Set "url" when the user PASTED an image URL/link in their message; otherwise leave it \
+null and the user's ATTACHED image(s) are used. Use position "after_executive" if they want it below the executive \
+summary, else "end". Emit whenever the user asks to attach/add/embed/include/insert an image, photo or picture.
 - {{"op": "set_volume", "volume": 5000}}                      target production volume
 - {{"op": "set_qty", "match": "<mpn/designator/text>", "qty": 3}}
 - {{"op": "remove_line", "match": "<mpn/designator/text>"}}
@@ -235,6 +251,13 @@ def apply_edit(
                 report_json.setdefault("meta", {})["title"] = new_title
                 changes.append(f'title → "{new_title}"')
 
+        elif kind == "set_section_title":
+            section = _canonical_section(str(op.get("section") or ""))
+            new_title = str(op.get("title") or "").strip()
+            if section and new_title:
+                report_json.setdefault("section_titles", {})[section] = new_title
+                changes.append(f'{section.replace("_", " ")} heading → "{new_title}"')
+
         elif kind == "remove_section":
             section = _canonical_section(str(op.get("section") or ""))
             if section:
@@ -244,8 +267,14 @@ def apply_edit(
                     changes.append(f"removed the {section.replace('_', ' ')} section")
 
         elif kind == "add_image":
+            # Prefer the user's attached image(s); fall back to a URL pasted in the
+            # request when nothing was attached, so "add this image: <url>" works too.
+            refs = list(image_refs or [])
+            op_url = str(op.get("url") or "").strip()
+            if not refs and op_url.lower().startswith(("http://", "https://")):
+                refs = [{"url": op_url, "name": op.get("caption") or ""}]
             added = _add_images(
-                report_json, image_refs or [],
+                report_json, refs,
                 op.get("position", "end"), op.get("caption"),
             )
             if added:
