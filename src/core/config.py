@@ -151,3 +151,19 @@ STORAGE_BUCKET_ORIGINAL = os.getenv("STORAGE_BUCKET_2", "original_uploads").stri
 AUTH_REDIRECT_URL = os.getenv(
     "AUTH_REDIRECT_URL", "http://localhost:5173/auth/callback"
 ).strip().strip('"').strip("'")
+
+# External parts database (read-only): a separate Postgres holding the JLCPCB
+# component dataset (MPN, stock, quantity-break pricing). Used for exact-MPN
+# existence + pricing lookups. Kept fully separate from the app's own DB above.
+PG_HOST = os.getenv("PG_HOST", "").strip().strip('"').strip("'")
+PG_PORT = int((os.getenv("PG_PORT", "5432").strip().strip('"').strip("'")) or "5432")
+PG_USER = os.getenv("PG_USER", "").strip().strip('"').strip("'")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "").strip().strip('"').strip("'")
+PG_DATABASE = os.getenv("PG_DATABASE", "").strip().strip('"').strip("'")
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public").strip().strip('"').strip("'")
+PG_TABLE = os.getenv("PG_TABLE", "components").strip().strip('"').strip("'")
+PG_ENABLED = os.getenv("PG_ENABLED", "false").strip().strip('"').strip("'").lower() in {
+    "1",
+    "true",
+    "yes",
+}
