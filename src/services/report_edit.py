@@ -5,7 +5,7 @@ run. An edit is classified into:
   - prose-only      → rewrite one narrative field, no recompute.
   - data (no API)   → patch ``_compute`` (qty, volume, rate, remove line, user
                       price) then recompute the deterministic numbers downstream.
-  - sourcing        → one targeted Mouser call (re-price / add a line) then
+  - sourcing        → one targeted parts-DB lookup (re-price / add a line) then
                       recompute.
 
 Edits never silently change unrelated numbers — only the requested fields and
@@ -20,7 +20,7 @@ import logging
 import re
 from typing import Any
 
-from src.services import mouser, report_pipeline
+from src.services import fx, parts_pricing, report_pipeline
 from src.services.llm_analysis import invoke_llm, parse_json_object
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ stencil rate-card inputs, not the final per-unit figure). You cannot set "Compon
 is derived from BOM lines; edit lines/prices instead.
 - {{"op": "set_rate", "target": "per_joint"|"setup"|"stencil", "value": 0.2}}   assembly rate card (per-joint/setup/stencil inputs)
 - {{"op": "rewrite_prose", "field": "executive_summary"|"architecture_analysis"|"market_context"|"data_confidence"|"cost_driver_insight", "instruction": "<how>"}}
-- {{"op": "reprice_line", "match": "<...>", "mpn": "<MPN to price on Mouser>"}}   needs a live lookup
+- {{"op": "reprice_line", "match": "<...>", "mpn": "<MPN to price from the parts database>"}}   needs a live lookup
 - {{"op": "add_line", "mpn": "<MPN or null>", "qty": 1, "description": "<...>", "category": "ic"}}   needs lookup
 
 "match" is matched case-insensitively against a line's MPN, designator or description.
@@ -335,6 +335,18 @@ def apply_edit(
     lines = compute.setdefault("lines", [])
     assembly = compute.setdefault("assembly", {})
 
+    # USD→INR rate for any live parts-DB re-price. Reuse the rate the report was
+    # built with (stored in ``_compute.fx``) so an edit stays consistent with the
+    # rest of the figures; fall back to a fresh fetch if it's missing.
+    def _edit_fx_rate() -> float:
+        stored = (compute.get("fx") or {}).get("rate")
+        try:
+            if stored and float(stored) > 0:
+                return float(stored)
+        except (TypeError, ValueError):
+            pass
+        return float(fx.fetch_usd_inr()["rate"])
+
     recompute_needed = False
     changes: list[str] = []
 
@@ -499,14 +511,14 @@ def apply_edit(
             ln = _match_line(lines, op.get("match", ""))
             mpn = (op.get("mpn") or (ln.get("mpn") if ln else None) or "").strip()
             if ln is not None and mpn:
-                part = mouser.search_part(mpn)
+                part = parts_pricing.price_one(mpn, _edit_fx_rate())
                 if part and part.get("price_breaks"):
-                    ln["mpn"] = part.get("mpn") or mpn
+                    ln["mpn"] = mpn or part.get("mpn")
                     ln["make"] = part.get("manufacturer") or ln.get("make")
                     ln["price_breaks"] = part["price_breaks"]
                     ln["hsn"] = part.get("hsn") or ln.get("hsn")
                     ln["tag"] = "Live"
-                    ln["source"] = "Mouser"
+                    ln["source"] = "JLCPCB"
                     ln["confidence"] = "high"
                     ln["user_price"] = None
                     ln["note"] = ""
@@ -544,16 +556,16 @@ def apply_edit(
             }
             if mpn:
                 emit("rendering", "in_progress", "Pricing the new component…")
-                part = mouser.search_part(mpn)
+                part = parts_pricing.price_one(mpn, _edit_fx_rate())
                 if part and part.get("price_breaks"):
                     new_line.update({
-                        "mpn": part.get("mpn") or mpn,
+                        "mpn": mpn or part.get("mpn"),
                         "make": part.get("manufacturer"),
                         "description": part.get("description") or new_line["description"],
                         "price_breaks": part["price_breaks"],
                         "hsn": part.get("hsn"),
                         "tag": "Live",
-                        "source": "Mouser",
+                        "source": "JLCPCB",
                         "confidence": "high",
                         "note": "",
                     })

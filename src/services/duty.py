@@ -1,9 +1,9 @@
 """Customs-duty pass: HSN → BCD / SWS / IGST → landed INR cost.
 
-Rates are hardcoded here (no DB table), keyed by the 4-digit HSN prefix. The HSN
-comes from the Mouser ``ProductCompliance`` CNHTS field; when it's missing we use
-``DEFAULT_RATES`` (and only ask the LLM to classify when CNHTS is entirely
-absent — that classification lives in the pipeline, not here).
+Rates are hardcoded here (no DB table), keyed by the 4-digit HSN prefix. The parts
+database carries no HSN, so the code is classified by the LLM (or a per-category
+default); when none can be determined we fall back to ``DEFAULT_RATES``. That
+classification lives in the pipeline, not here.
 
 Landed-cost math (SWS is 10% *of the BCD amount*; IGST is on the duty-inclusive
 value):

@@ -5,9 +5,9 @@ Generates (or edits) a professional should-cost PDF report for a project. It:
 1.  Reads the project knowledge base (vision-derived components/pcb/enclosure/…).
 2.  Uses HILT (``interrupt()``) to ask a SMALL number of clarifying questions
     when material data is missing; answers are persisted + folded back into KB.
-3.  Resolves MPNs, then in parallel prices the BOM (Mouser), quotes the PCB
+3.  Resolves MPNs, then in parallel prices the BOM (parts DB), quotes the PCB
     (PCBWay), estimates non-quotable blocks, and gathers market context (Tavily).
-4.  Applies FX (PCBWay only), customs duty, the assembly model and the volume
+4.  Applies FX (parts-DB prices + PCBWay), customs duty, the assembly model and the volume
     curve, aggregates one structured JSON, fills the locked HTML template,
     renders a PDF, uploads it to the ``reports`` bucket, and streams the result.
 
@@ -492,7 +492,7 @@ def report_generation_tool(
     Call this whenever the user asks to generate a report, a should-cost report,
     a BOM cost report, a cost breakdown PDF, or similar. It reads the project's
     knowledge base, asks a few clarifying questions only if needed, prices the BOM
-    (Mouser), quotes the PCB (PCBWay), applies duty and assembly costs across a
+    (parts DB), quotes the PCB (PCBWay), applies duty and assembly costs across a
     volume curve, renders a PDF in the locked report format, and streams it.
 
     To CHANGE a report that already exists in this conversation, use the dedicated

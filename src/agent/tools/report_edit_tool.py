@@ -64,7 +64,7 @@ def report_edit_tool(
       - Images: "attach this photo below the executive summary", "add this image
         to the report", "remove the image".
       - Cost inputs: "use 5,000 units", "remove the LED line", "set the MCU price
-        to ₹120", "change the per-joint assembly rate", "re-price U1 from Mouser",
+        to ₹120", "change the per-joint assembly rate", "re-price U1 live",
         "add a 10µF capacitor line".
       - Any other adjustment to the report that already exists.
 

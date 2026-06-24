@@ -26,7 +26,7 @@ from src.core.config import (
     ASSEMBLY_STENCIL_FEE_INR,
     REPORT_VOLUME_CURVE,
 )
-from src.services import duty, fx, mouser, pcbway, report_estimators
+from src.services import duty, fx, parts_pricing, pcbway, report_estimators
 from src.services.failure_log import record_failure
 
 logger = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ def pins_for_package(package: str | None, category: str | None = None) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Stage C — price each BOM line (resolved-MPN → Mouser; else rate card)
+# Stage C — price each BOM line (resolved-MPN → parts DB; else rate card)
 # --------------------------------------------------------------------------- #
 def _qty(component: dict[str, Any]) -> int:
     try:
@@ -148,13 +148,37 @@ def _qty(component: dict[str, Any]) -> int:
         return 1
 
 
+def _resolve_line_mpn(
+    component: dict[str, Any],
+    resolution: dict[str, Any] | None,
+    category: str,
+) -> tuple[str | None, bool]:
+    """Pick the MPN to price for a line and whether it's a generic passive."""
+    resolved_mpn = None
+    is_generic = False
+    if resolution:
+        is_generic = bool(resolution.get("is_generic_passive"))
+        resolved_mpn = (resolution.get("resolved_mpn") or "").strip() or None
+    if not resolved_mpn:
+        resolved_mpn = (component.get("mpn") or "").strip() or None
+    if category in _GENERIC_CATEGORIES and not (component.get("mpn") or "").strip():
+        is_generic = True
+    return resolved_mpn, is_generic
+
+
 def _price_one_line(
     index: int,
     component: dict[str, Any],
     resolution: dict[str, Any] | None,
     volumes: list[int],
+    parts_map: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Resolve + price one component across all volumes. Never raises."""
+    """Resolve + price one component across all volumes. Never raises.
+
+    Pricing comes from ``parts_map`` (a pre-fetched parts-DB lookup keyed by
+    ``lower(mpn)``, prices already in INR); lines with no match fall back to the
+    rate card.
+    """
     ref_des = component.get("ref_des") or f"#{index + 1}"
     category = _categorize(component, resolution)
     qty = _qty(component)
@@ -165,15 +189,7 @@ def _price_one_line(
     )
     pkg = component.get("package") or "—"
 
-    resolved_mpn = None
-    is_generic = False
-    if resolution:
-        is_generic = bool(resolution.get("is_generic_passive"))
-        resolved_mpn = (resolution.get("resolved_mpn") or "").strip() or None
-    if not resolved_mpn:
-        resolved_mpn = (component.get("mpn") or "").strip() or None
-    if category in _GENERIC_CATEGORIES and not (component.get("mpn") or "").strip():
-        is_generic = True
+    resolved_mpn, is_generic = _resolve_line_mpn(component, resolution, category)
 
     line: dict[str, Any] = {
         "ref_des": ref_des,
@@ -196,22 +212,23 @@ def _price_one_line(
     }
 
     part = None
-    if not is_generic and resolved_mpn and mouser.is_configured():
-        part = mouser.search_part(resolved_mpn)
+    if not is_generic and resolved_mpn:
+        part = parts_map.get(resolved_mpn.lower())
 
     if part and part.get("price_breaks"):
-        line["mpn"] = part.get("mpn") or resolved_mpn
+        # Keep the resolved MPN's original casing — the parts DB stores it lowercased.
+        line["mpn"] = resolved_mpn or part.get("mpn")
         line["make"] = part.get("manufacturer") or line["make"]
         if part.get("description"):
             line["description"] = part["description"]
         line["hsn"] = part.get("hsn")
         line["datasheet_url"] = part.get("datasheet_url")
-        line["source"] = "Mouser"
+        line["source"] = "JLCPCB"
         line["tag"] = "Live"
         line["confidence"] = "high"
         line["price_breaks"] = part["price_breaks"]
         for v in volumes:
-            p = mouser.price_for_qty(part["price_breaks"], v)
+            p = parts_pricing.price_for_qty(part["price_breaks"], v)
             if p is not None:
                 line["price_by_volume"][v] = round(p, 4)
         if not line["price_by_volume"]:
@@ -236,23 +253,47 @@ def _price_one_line(
     return line
 
 
+def _collect_mpns(
+    components: list[dict[str, Any]],
+    resolutions: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Resolved, non-generic MPNs to batch-price against the parts DB."""
+    mpns: list[str] = []
+    for idx, component in enumerate(components):
+        ref_des = component.get("ref_des") or f"#{idx + 1}"
+        resolution = resolutions.get(str(ref_des))
+        category = _categorize(component, resolution)
+        resolved_mpn, is_generic = _resolve_line_mpn(component, resolution, category)
+        if resolved_mpn and not is_generic:
+            mpns.append(resolved_mpn)
+    return mpns
+
+
 def _run_pricing(
     components: list[dict[str, Any]],
     resolutions: dict[str, dict[str, Any]],
     volumes: list[int],
+    fx_rate: float,
     emit: Emit,
 ) -> list[dict[str, Any]]:
-    """Price all BOM lines, emitting per-item progress (runs on the caller thread)."""
+    """Price all BOM lines, emitting per-item progress (runs on the caller thread).
+
+    All resolved MPNs are priced in one batched parts-DB lookup (USD→INR via
+    ``fx_rate``) before lines are built, so the DB is hit once for the whole BOM.
+    """
     total = len(components)
     if total == 0:
         return []
+
+    parts_map = parts_pricing.price_mpns(_collect_mpns(components, resolutions), fx_rate)
+
     indexed: list[tuple[int, dict[str, Any]]] = []
     with ThreadPoolExecutor(max_workers=min(8, total)) as ex:
         futures = {}
         for idx, component in enumerate(components):
             ref_des = component.get("ref_des") or f"#{idx + 1}"
             resolution = resolutions.get(str(ref_des))
-            futures[ex.submit(_price_one_line, idx, component, resolution, volumes)] = idx
+            futures[ex.submit(_price_one_line, idx, component, resolution, volumes, parts_map)] = idx
         done = 0
         for fut in as_completed(futures):
             idx = futures[fut]
@@ -265,7 +306,7 @@ def _run_pricing(
             if line is not None:
                 indexed.append((idx, line))
                 label = line.get("mpn") or line.get("description") or line.get("ref_des")
-                src = "Mouser" if line["source"] == "Mouser" else "an estimate"
+                src = "the parts database" if line["source"] == "JLCPCB" else "an estimate"
                 emit(
                     "pricing", "in_progress",
                     f"Pricing component {done} of {total} ({label}) via {src}…",
@@ -282,11 +323,14 @@ def _run_pricing(
 # --------------------------------------------------------------------------- #
 # Stage E — PCB fab quote (PCBWay live USD → INR, else heuristic INR)
 # --------------------------------------------------------------------------- #
-def _run_fab(pcb: dict[str, Any], volumes: list[int]) -> dict[str, Any]:
-    """Quote the bare board at each volume. Returns INR per board + provenance."""
+def _run_fab(pcb: dict[str, Any], volumes: list[int], fx_info: dict[str, Any]) -> dict[str, Any]:
+    """Quote the bare board at each volume. Returns INR per board + provenance.
+
+    Uses the already-fetched ``fx_info`` (shared with component pricing) so the
+    whole run converts USD→INR at a single, consistent rate.
+    """
     fab_by_volume: dict[int, float] = {}
     live = False
-    fx_info = fx.fetch_usd_inr()
     rate = float(fx_info["rate"])
     for v in volumes:
         q = pcbway.quote_board(pcb, v)
@@ -354,7 +398,7 @@ def _run_market(product_label: str, structured: dict[str, Any]) -> dict[str, Any
 # --------------------------------------------------------------------------- #
 def _apply_duty(lines: list[dict[str, Any]], volumes: list[int]) -> None:
     """Attach duty rates + landed prices per volume to each line."""
-    # Classify HSN only for lines Mouser gave none for.
+    # Classify HSN only for lines the parts DB gave none for.
     missing = [ln for ln in lines if not duty.hsn_prefix(ln.get("hsn"))]
     classified: dict[str, str] = {}
     if missing:
@@ -478,7 +522,7 @@ def _line_base_price(line: dict[str, Any], volume: int) -> float:
         return float(line["user_price"])
     breaks = line.get("price_breaks")
     if breaks:
-        p = mouser.price_for_qty(breaks, volume)
+        p = parts_pricing.price_for_qty(breaks, volume)
         if p is not None:
             return round(p, 4)
     return _rate_card_price(line.get("category") or "other", volume)
@@ -603,21 +647,26 @@ def run_pipeline(
     emit("resolving_mpns", "done", "Part numbers identified.")
 
     # --- Step 4: PARALLEL price (C) | fab (E) | non-quotable (F) | market (G) - #
-    emit("pricing", "started", "Pricing components via Mouser…")
+    # Fetch the USD→INR rate once and share it across component pricing and the fab
+    # quote, so the whole run converts at a single consistent rate.
+    fx_info = fx.fetch_usd_inr()
+    fx_rate = float(fx_info["rate"])
+
+    emit("pricing", "started", "Pricing components from the parts database…")
     emit("fab_quote", "started", "Getting PCB fab quote from PCBWay…")
     emit("non_quotable", "started", "Estimating firmware, tooling & labour…")
     emit("market_context", "started", "Gathering market & sourcing data from the web…")
 
     with ThreadPoolExecutor(max_workers=3) as ex:
-        fab_future = ex.submit(_run_fab, pcb, price_volumes)
+        fab_future = ex.submit(_run_fab, pcb, price_volumes, fx_info)
         nq_future = ex.submit(report_estimators.estimate_non_quotable, structured)
         mkt_future = ex.submit(_run_market, product_label, structured)
 
         # C (pricing) runs on this thread so its per-item progress streams cleanly.
-        lines = _run_pricing(components, resolutions, price_volumes, emit)
+        lines = _run_pricing(components, resolutions, price_volumes, fx_rate, emit)
         live_count = sum(1 for ln in lines if ln["tag"] == "Live")
         est_count = len(lines) - live_count
-        if not mouser.is_configured():
+        if not parts_pricing.is_configured():
             data_quality.append(
                 "Live component pricing was unavailable for this run, so the bill of "
                 "materials uses industry rate-card estimates — confirm before quoting."
@@ -640,7 +689,7 @@ def run_pipeline(
                 error=exc, context={"volumes": price_volumes},
             )
             fab = {"fab_by_volume": {v: pcbway.heuristic_quote_inr(pcb, v) for v in price_volumes},
-                   "live": False, "fx": fx.fetch_usd_inr(), "source": "Internal fab model",
+                   "live": False, "fx": fx_info, "source": "Internal fab model",
                    "tag": "Est", "params": pcbway.build_payload(pcb, 1000)}
         if not fab["live"]:
             data_quality.append(
@@ -686,9 +735,9 @@ def run_pipeline(
             )
         emit("market_context", "done", "Market context gathered.")
 
-    # --- Step 5: FX (already fetched in fab; surface its provenance) --------- #
-    fx_info = fab.get("fx") or fx.fetch_usd_inr()
-    emit("fx", "started", "Applying USD→INR exchange rate to the fab quote…")
+    # --- Step 5: FX (shared rate already applied to pricing + fab; surface it) - #
+    fx_info = fab.get("fx") or fx_info
+    emit("fx", "started", "Applying USD→INR exchange rate to component & fab costs…")
     if fx_info.get("source") == fx.SOURCE_CACHED:
         data_quality.append("Exchange rate is from a recent cached value rather than today's live rate.")
     elif fx_info.get("source") == fx.SOURCE_FALLBACK:
@@ -775,8 +824,8 @@ def aggregate(
     methodology = [
         {"stage": "Component identification", "source": "Teardown photos + spec",
          "method": "Vision MPN read + parametric match", "confidence": "High"},
-        {"stage": "Component pricing", "source": "Mouser API",
-         "method": "Live qty-break lookup (INR)",
+        {"stage": "Component pricing", "source": "JLCPCB parts database",
+         "method": "Live qty-break lookup (USD→INR)",
          "confidence": "High" if any(l["tag"] == "Live" for l in lines) else "Low"},
         {"stage": "Landed / customs", "source": "HSN tariff table",
          "method": "Per-MPN HSN → BCD / SWS / IGST", "confidence": "Medium"},

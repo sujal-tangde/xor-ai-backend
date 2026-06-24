@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 # Step 3 — MPN resolution
 # --------------------------------------------------------------------------- #
 _RESOLVE_PROMPT = """You are an electronics sourcing expert. For each component below (from a teardown of a \
-physical product), propose the most likely REAL manufacturer part number (MPN) so it can be priced on a \
-distributor (Mouser).
+physical product), propose the most likely REAL manufacturer part number (MPN) so it can be priced against a \
+parts database (JLCPCB/LCSC catalog).
 
 Rules:
 - Use the component's type, package, function, value and top_mark to infer the MPN.
@@ -93,7 +93,7 @@ def resolve_mpns(components: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
-# Step 6 (assist) — HSN classification, ONLY when Mouser gave no CNHTS at all
+# Step 6 (assist) — HSN classification, ONLY when the parts DB gave no HSN at all
 # --------------------------------------------------------------------------- #
 _HSN_PROMPT = """You are a customs-classification assistant for electronic components imported into India. \
 For each component below, give the most likely 4-digit HSN heading (Indian customs). Use these common headings:
@@ -113,7 +113,7 @@ COMPONENTS (JSON):
 
 
 def classify_hsns(components: list[dict[str, Any]]) -> dict[str, str]:
-    """Map ref_des -> 4-digit HSN for components Mouser couldn't supply one for."""
+    """Map ref_des -> 4-digit HSN for components the parts DB couldn't supply one for."""
     if not components:
         return {}
     slim = [
