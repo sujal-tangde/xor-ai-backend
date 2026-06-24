@@ -278,7 +278,7 @@ def get_conversation_messages(
     result = (
         get_supabase()
         .table("messages")
-        .select("role, content, file_ids, tools_used, report, seq")
+        .select("role, content, file_ids, tools_used, report, seq, created_at")
         .eq("conversation_id", conversation_id)
         .order("seq", desc=True)
         .limit(limit)
@@ -295,6 +295,8 @@ def get_conversation_messages(
             msg["tools_used"] = row["tools_used"]
         if row.get("report"):
             msg["report"] = row["report"]
+        if row.get("created_at"):
+            msg["created_at"] = row["created_at"]
         out.append(msg)
     return out
 
@@ -307,15 +309,18 @@ def save_messages(
         return
     rows = []
     for msg in messages:
-        rows.append(
-            {
-                "conversation_id": conversation_id,
-                "user_id": user_id,
-                "role": msg.get("role", "user"),
-                "content": msg.get("content") or "",
-                "file_ids": msg.get("file_ids"),
-                "tools_used": msg.get("tools_used"),
-                "report": msg.get("report"),
-            }
-        )
+        row = {
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "role": msg.get("role", "user"),
+            "content": msg.get("content") or "",
+            "file_ids": msg.get("file_ids"),
+            "tools_used": msg.get("tools_used"),
+            "report": msg.get("report"),
+        }
+        # Persist the actual send time stamped when the message was created, so it
+        # survives a reload accurately; fall back to the column default otherwise.
+        if msg.get("created_at"):
+            row["created_at"] = msg["created_at"]
+        rows.append(row)
     get_supabase().table("messages").insert(rows).execute()

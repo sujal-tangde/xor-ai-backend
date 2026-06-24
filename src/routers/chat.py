@@ -1,6 +1,7 @@
 """WebSocket endpoint for real-time chat with the AI agent (auth-protected)."""
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -16,6 +17,11 @@ from src.services.chat_history import (
 )
 
 router = APIRouter(tags=["chat"])
+
+
+def _now_iso() -> str:
+    """Current UTC time as an ISO 8601 string, stamped on each message when sent."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def _hydrate_if_needed(conversation_id: str) -> None:
@@ -229,7 +235,7 @@ async def chat_socket(websocket: WebSocket):
                     return
                 project_id = conv.get("project_id")
 
-            user_message: dict = {"role": "user", "content": str(message)}
+            user_message: dict = {"role": "user", "content": str(message), "created_at": _now_iso()}
             if file_ids:
                 user_message["file_ids"] = file_ids
             agent_messages = [*history, user_message]
@@ -259,7 +265,7 @@ async def chat_socket(websocket: WebSocket):
                 return
 
             reply = result["reply"]
-            assistant_message: dict = {"role": "assistant", "content": reply}
+            assistant_message: dict = {"role": "assistant", "content": reply, "created_at": _now_iso()}
             if result["tools_used"]:
                 assistant_message["tools_used"] = result["tools_used"]
             slim = _slim_report(result["report"])
@@ -325,7 +331,7 @@ async def chat_socket(websocket: WebSocket):
             return
 
         reply = result["reply"]
-        assistant_message = {"role": "assistant", "content": reply}
+        assistant_message = {"role": "assistant", "content": reply, "created_at": _now_iso()}
         if result["tools_used"]:
             assistant_message["tools_used"] = result["tools_used"]
         slim = _slim_report(result["report"])
