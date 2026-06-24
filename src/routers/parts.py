@@ -20,18 +20,8 @@ class MpnLookupRequest(BaseModel):
     mpns: list[str] = Field(default_factory=list)
 
 
-@router.get("/health")
-async def health(user=Depends(get_current_user)):
-    if not parts_db.is_enabled():
-        raise HTTPException(status_code=503, detail="Parts database is not enabled.")
-    try:
-        return await asyncio.to_thread(parts_db.ping)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Parts DB unreachable: {exc}") from exc
-
-
 @router.post("/lookup")
-async def lookup(payload: MpnLookupRequest, user=Depends(get_current_user)):
+async def lookup(payload: MpnLookupRequest):
     """Check whether each MPN exists in the parts DB and return its detail.
 
     Body: ``{"mpns": ["0805B101K500CT", ...]}``. Matching is exact and

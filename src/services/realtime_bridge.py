@@ -53,13 +53,25 @@ async def run_subscriber() -> None:
     import redis.asyncio as aioredis
 
     while True:
+        client = None
         try:
-            client = aioredis.from_url(REDIS_URL)
+            # health_check_interval keeps the (often idle) connection alive by
+            # periodically PINGing, so Redis Cloud doesn't drop it. We poll with
+            # get_message(timeout=...) rather than the blocking listen(), so an
+            # idle channel returns None instead of raising a socket read timeout.
+            client = aioredis.from_url(
+                REDIS_URL,
+                socket_keepalive=True,
+                health_check_interval=30,
+            )
             pubsub = client.pubsub()
             await pubsub.subscribe(INSIGHTS_CHANNEL)
             logger.info("Realtime subscriber listening on %s", INSIGHTS_CHANNEL)
-            async for raw in pubsub.listen():
-                if raw.get("type") != "message":
+            while True:
+                raw = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if raw is None or raw.get("type") != "message":
                     continue
                 try:
                     event = json.loads(raw["data"])
@@ -82,3 +94,9 @@ async def run_subscriber() -> None:
         except Exception:
             logger.exception("Realtime subscriber error; reconnecting in 2s")
             await asyncio.sleep(2)
+        finally:
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
