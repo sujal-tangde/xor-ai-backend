@@ -189,6 +189,7 @@ def update_report(
     pdf_path: str | None = None,
     pdf_url: str | None = None,
     status: str | None = None,
+    clear_pdf: bool = False,
 ) -> dict[str, Any] | None:
     payload: dict[str, Any] = {"updated_at": _now()}
     if title is not None:
@@ -201,14 +202,47 @@ def update_report(
         payload["html"] = html
     if markdown_text is not None:
         payload["markdown"] = markdown_text
-    if pdf_path is not None:
-        payload["pdf_path"] = pdf_path
-    if pdf_url is not None:
-        payload["pdf_url"] = pdf_url
+    # ``clear_pdf`` nulls the stored PDF so the download route re-renders fresh
+    # from the (just-updated) HTML until a new PDF is rendered in the background.
+    if clear_pdf:
+        payload["pdf_path"] = None
+        payload["pdf_url"] = None
+    else:
+        if pdf_path is not None:
+            payload["pdf_path"] = pdf_path
+        if pdf_url is not None:
+            payload["pdf_url"] = pdf_url
     if status is not None:
         payload["status"] = status
     result = get_supabase().table("reports").update(payload).eq("id", report_id).execute()
     return result.data[0] if result.data else None
+
+
+def report_exists(
+    conversation_id: str | None, project_id: str, user_id: str | None = None
+) -> bool:
+    """Fast check: does any report exist for this conversation or project?
+
+    Used by the chat router to skip the LLM intent classification entirely when no
+    report exists yet (edits/fetch are impossible, so there's nothing to route).
+    On error, returns True so the router still runs (correctness over speed).
+    """
+    try:
+        client = get_supabase()
+        if conversation_id:
+            r = (
+                client.table("reports").select("id")
+                .eq("conversation_id", conversation_id).limit(1).execute()
+            )
+            if r.data:
+                return True
+        q = client.table("reports").select("id").eq("project_id", project_id)
+        if user_id is not None:
+            q = q.eq("user_id", user_id)
+        return bool(q.limit(1).execute().data)
+    except Exception:
+        logger.warning("report_exists check failed; assuming a report exists", exc_info=True)
+        return True
 
 
 def get_report(report_id: str, user_id: str | None = None) -> dict[str, Any] | None:

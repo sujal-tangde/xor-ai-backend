@@ -28,6 +28,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
+from src.agent.html_editor import _title_of
 from src.agent.tools.validation import invalid_project_id_message, is_uuid
 from src.core.config import REPORT_DEFAULT_VOLUME
 from src.services import report_builder, report_edit, report_pipeline, report_template, reports
@@ -328,6 +329,9 @@ def _render_store_stream(
         "kind": "report_ready",
         "report_id": report_id,
         "title": title,
+        # The rendered HTML backs the full-fidelity preview (iframe); markdown is
+        # the fallback for any consumer that only reads the markdown column.
+        "html": html,
         "markdown": markdown_text,
         "pdf_url": pdf_url,
         "volume": volume,
@@ -370,121 +374,107 @@ def _image_position_from_text(*texts: str | None) -> str:
     return "end"
 
 
-def _generate_modification(
+def load_latest_report(
+    conversation_id: str | None, project_id: str, user_id: str | None
+) -> dict[str, Any] | None:
+    """The report to edit/show: this conversation's latest, else the project's.
+
+    Reports belong to a project, not just one chat, so a report generated in an
+    earlier conversation is still the right one to edit/display here.
+    """
+    base = (
+        reports.latest_report_for_conversation(conversation_id)
+        if conversation_id
+        else None
+    )
+    if base is None or not base.get("html"):
+        base = reports.latest_report_for_project(project_id, user_id) or base
+    return base
+
+
+def save_edited_html(
+    *,
+    base: dict[str, Any],
+    html: str,
+    markdown_text: str | None,
     project_id: str,
     conversation_id: str | None,
     user_id: str | None,
-    request: str,
-    modification_request: str,
-    file_ids: list[str] | None = None,
-    *,
-    emit=None,
-    writer=None,
-) -> str:
-    """Edit the latest report for this conversation, operating on its saved JSON.
+    emit,
+) -> dict[str, Any]:
+    """Persist an edited report whose HTML is now authoritative (NO PDF render).
 
-    ``emit``/``writer`` may be injected by a non-LangGraph caller (the direct
-    report-edit fast path); when omitted they are sourced from the LangGraph
-    stream writer as usual.
+    The edited HTML is the source of truth: the row's ``html``/``markdown`` are
+    overwritten and the stale PDF is cleared (``clear_pdf``) so a download
+    re-renders fresh from the new HTML until :func:`render_edited_pdf` finishes in
+    the background. ``report_json`` is deliberately NOT written — after a free-form
+    edit it is a stale generation artifact and must never clobber the edited HTML.
+
+    Returns the payload for a ``report_ready`` event. PDF rendering is deferred to
+    keep the edit off the (slow) Playwright path; the preview only needs the HTML.
     """
-    if emit is None or writer is None:
-        emit, writer = _make_emit()
-    base = reports.latest_report_for_conversation(conversation_id) if conversation_id else None
-    # Reports belong to a project, not just one chat. If this conversation has no
-    # report of its own yet, fall back to the project's latest so the user can edit
-    # a report they generated in an earlier conversation.
-    if base is None or not base.get("report_json"):
-        base = reports.latest_report_for_project(project_id, user_id) or base
-    if base is None or not base.get("report_json"):
-        return (
-            "There's no existing report for this product yet. "
-            "Ask me to generate a report first, then I can tweak it."
-        )
-
-    report_json = base["report_json"]
+    report_id = base["id"]
+    # The title may have changed in a free-form edit — read it back from the HTML
+    # (cover <h1>/<title>) so the chat list + panel header stay in sync.
+    title = _title_of(html) or base.get("title") or "Should-Cost Report"
+    volume = base.get("volume") or REPORT_DEFAULT_VOLUME
+    report_json = base.get("report_json")
     if isinstance(report_json, str):
         try:
             report_json = json.loads(report_json)
         except json.JSONDecodeError:
-            return "The saved report couldn't be read for editing — please regenerate it."
+            report_json = {}
+    fx_rate = ((report_json or {}).get("fx") or {}).get("rate") if isinstance(report_json, dict) else None
 
-    image_refs = _resolve_image_refs(file_ids)
-    images_before = len(report_json.get("images") or [])
-
-    emit("rendering", "started", "Applying your requested changes…")
-    report_json, summary = report_edit.apply_edit(
-        report_json, modification_request, emit, image_refs=image_refs,
-    )
-
-    # Fallback: if the user attached an image and clearly wants it embedded but the
-    # edit classifier didn't emit an add_image op, attach it here. Intent is read
-    # from the VERBATIM request too — the model's paraphrase often drops it.
-    image_intended = _wants_image_attached(request, modification_request)
-    if (
-        image_refs
-        and len(report_json.get("images") or []) == images_before
-        and image_intended
-    ):
-        position = _image_position_from_text(request, modification_request)
-        added = report_edit._add_images(report_json, image_refs, position, None)
-        if added:
-            summary = (summary + f"; attached {added} image(s)").strip("; ")
-
-    images_added = len(report_json.get("images") or []) - images_before
-
-    # Nothing actually changed (no data/prose edit applied, no image attached).
-    # Report this honestly instead of re-rendering and claiming success — claiming
-    # a change that didn't happen is what drives the "I updated it" / "no it's the
-    # same" loop. Don't stream report_ready, so the UI doesn't imply a new version.
-    if not summary and images_added <= 0:
-        emit("rendering", "done", "No change applied.")
-        return (
-            "I wasn't able to apply that change to the report — I couldn't map the "
-            f'request ("{request.strip()}") to a concrete edit, so the report is '
-            "unchanged. Could you say exactly which part to change and the target "
-            "value? For example: \"set the PCB assembly cost to ₹90\", \"rename the "
-            "report to X\", \"remove the LED line\", or \"use 5,000 units\". "
-            "Do NOT tell the user the report was updated — it was not."
+    emit("storing", "started", "Saving your changes…")
+    try:
+        reports.update_report(
+            report_id,
+            title=title,
+            html=html,
+            markdown_text=markdown_text,
+            clear_pdf=True,
         )
+        emit("storing", "done", "Changes saved.")
+    except Exception as exc:
+        logger.warning("Persisting edited report failed", exc_info=True)
+        record_failure(
+            "storing", title or "report",
+            "Could not save the edited report (persist failed)",
+            error=exc, context={"project_id": project_id, "report_id": report_id},
+        )
+        emit("storing", "error", "We couldn't save the changes — please try again.")
 
-    title = (report_json.get("meta") or {}).get("title") or base.get("title") or "Should-Cost Report"
-    volume = (report_json.get("meta") or {}).get("volume") or base.get("volume") or REPORT_DEFAULT_VOLUME
+    emit("report_ready", "done", "Report updated.")
+    return {
+        "report_id": report_id,
+        "title": title,
+        "html": html,
+        "markdown": markdown_text,
+        "pdf_url": None,  # re-rendered on download / by render_edited_pdf below
+        "volume": volume,
+        "fx_rate": fx_rate,
+    }
 
-    _render_store_stream(
-        report_json=report_json,
-        project_id=project_id,
-        conversation_id=conversation_id,
-        user_id=user_id,
-        title=title,
-        volume=int(volume),
-        emit=emit,
-        writer=writer,
-        existing_report_id=base["id"],
-    )
 
-    # Honest note about the image outcome so the assistant doesn't claim an attach
-    # that didn't happen.
-    image_note = ""
-    if image_intended and images_added <= 0:
-        if not image_refs:
-            image_note = (
-                " NOTE: I could not embed an image because no image file was attached to this "
-                "message (or it wasn't an image). Tell the user to attach the image to their "
-                "message and ask again — do NOT claim the image was added."
-            )
-        else:
-            image_note = " NOTE: the image could not be embedded — do NOT claim it was added."
-    return (
-        f'Updated the report — {summary}. The revised version is shown on the right and the PDF is '
-        f"ready to download. Let me know if you'd like any other changes.{image_note}"
-    )
+def render_edited_pdf(report_id: str, html: str) -> None:
+    """Render the edited HTML to a PDF and store it (runs in the background).
+
+    Best-effort: if it fails or hasn't finished yet, the download route still
+    re-renders from the stored HTML on demand, so the user is never blocked.
+    """
+    try:
+        pdf_bytes = reports.render_pdf_from_html(html)
+        pdf_path, pdf_url = reports.upload_report_pdf(report_id, pdf_bytes)
+        reports.update_report(report_id, pdf_path=pdf_path, pdf_url=pdf_url)
+    except Exception:
+        logger.warning("Background PDF render for edited report %s failed", report_id, exc_info=True)
 
 
 @tool(TOOL_NAME)
 def report_generation_tool(
     request: str,
     config: RunnableConfig = None,  # type: ignore[assignment]
-    modification_request: str | None = None,
     file_ids: list[str] | None = None,
 ) -> str:
     """Generate a NEW professional should-cost PDF report for the product.
@@ -495,17 +485,12 @@ def report_generation_tool(
     (parts DB), quotes the PCB (PCBWay), applies duty and assembly costs across a
     volume curve, renders a PDF in the locked report format, and streams it.
 
-    To CHANGE a report that already exists in this conversation, use the dedicated
-    ``report_edit`` tool instead — it is much faster (no KB re-read, no new
-    questions, no full re-pricing). ``modification_request`` here is retained only
-    as a backward-compatible fallback that delegates to the same edit logic.
+    This tool ONLY creates a report from scratch. To CHANGE a report that already
+    exists, the application routes the request to the free-form HTML edit engine
+    (not this tool) — you never need to edit a report yourself.
 
     Args:
         request: The user's request, verbatim (used to infer intent/volume).
-        modification_request: DEPRECATED entry point — prefer the ``report_edit``
-            tool. If set (e.g. "change the target volume to 5000", "remove the LED
-            line", "shorten the executive summary"), the existing report is edited
-            in place via the same logic ``report_edit`` uses.
         file_ids: The IDs of any images the user ATTACHED to this message that they
             want embedded in the report. Pass the attached file IDs here whenever
             the user asks to attach/add/embed an image or photo.
@@ -526,13 +511,6 @@ def report_generation_tool(
         return "No project is associated with this conversation, so I can't build a report."
     if not is_uuid(str(project_id)):
         return invalid_project_id_message(str(project_id))
-
-    # ---- Edit path: revise the existing report instead of rebuilding. ------- #
-    if modification_request and modification_request.strip():
-        return _generate_modification(
-            str(project_id), conversation_id, user_id,
-            request, modification_request.strip(), file_ids=file_ids,
-        )
 
     emit, writer = _make_emit()
 

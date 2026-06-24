@@ -143,9 +143,9 @@ NEW STRUCTURED ANALYSIS (JSON):
 """
 
 
-def _llm_completion_kwargs() -> dict[str, Any]:
+def _llm_completion_kwargs(model: str | None = None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
-        "model": LLM_MODEL,
+        "model": model or LLM_MODEL,
         "api_key": LLM_API_KEY or None,
         "aws_region_name": AWS_REGION,
     }
@@ -172,12 +172,20 @@ def is_retryable_llm_error(exc: Exception) -> bool:
     )
 
 
-def invoke_llm(messages: list[dict[str, Any]], *, max_tokens: int) -> str:
+def invoke_llm(
+    messages: list[dict[str, Any]], *, max_tokens: int, model: str | None = None
+) -> str:
+    """Invoke an LLM (default ``LLM_MODEL``) with retry on transient errors.
+
+    ``model`` overrides the model id for this call only (e.g. the cheap intent
+    router model, or the capable editor model) while reusing the same retry +
+    region/credential plumbing.
+    """
     last_error: Exception | None = None
     for attempt in range(LLM_MAX_RETRIES):
         try:
             response = litellm.completion(
-                **_llm_completion_kwargs(),
+                **_llm_completion_kwargs(model),
                 messages=messages,
                 max_tokens=max_tokens,
                 stream=False,

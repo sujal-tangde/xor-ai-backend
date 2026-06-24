@@ -21,6 +21,15 @@ WORKER_COUNT = int((os.getenv("WORKER_COUNT", "1").strip().strip('"').strip("'")
 LLM_MODEL = os.getenv("LLM_MODEL", "bedrock/qwen.qwen3-vl-235b-a22b")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip().strip('"').strip("'")
 LLM_API_BASE = os.getenv("LLM_API_BASE", "").strip().strip('"').strip("'")
+
+# A small/cheap model used ONLY for fast intent routing (classifying a chat
+# message into generate/edit/fetch/chat). It does no reasoning over report
+# content — just intent — so the smallest available model is fine. Falls back to
+# LLM_MODEL when unset so the app works out of the box; set this to a cheaper
+# Bedrock model (e.g. a Nova/Haiku-class id) to cut routing cost/latency.
+LLM_INTENT_MODEL = (
+    os.getenv("LLM_INTENT_MODEL", "").strip().strip('"').strip("'") or LLM_MODEL
+)
 LLM_TOOLS_ENABLED = os.getenv("LLM_TOOLS_ENABLED", "true").lower() in {
     "1",
     "true",

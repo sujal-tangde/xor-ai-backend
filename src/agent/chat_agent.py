@@ -1,4 +1,18 @@
-"""Chat agent for XOR Chat: Bedrock LLM + Tavily search, streamed token-by-token."""
+"""Chat agent for XOR Chat: Bedrock LLM + tools, streamed token-by-token.
+
+Routing is driven by an LLM intent router (``intent_router.classify``), not regex:
+
+  - ``edit``     → the deterministic free-form HTML edit engine
+                   (``html_editor.edit``), which modifies the report HTML directly
+                   and VERIFIES the change with a computed diff. It bypasses the
+                   deep agent entirely, so an edit can never be "claimed" without a
+                   real, verified change to the HTML.
+  - ``generate`` → the deep agent's ``report_generation`` tool (full pipeline +
+                   HILT clarifying questions).
+  - ``fetch``    → the deep agent's ``get_report`` tool (re-display only).
+  - ``chat``     → a plain greeting reply (no tools) for small talk, or the deep
+                   agent for substantive product questions (search, attachments).
+"""
 
 import asyncio
 import json
@@ -18,7 +32,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 from deepagents import create_deep_agent
 
+from src.agent import html_editor, intent_router
 from src.agent.tools import get_agent_tools, is_known_tool, tool_label
+from src.services import reports
 from src.core.config import (
     AWS_REGION,
     LLM_API_BASE,
@@ -28,10 +44,9 @@ from src.core.config import (
 
 logger = logging.getLogger(__name__)
 
-# Tool names that actually create or modify a report. Used by the
-# anti-fabrication backstop to tell a real report action from the model merely
-# claiming one.
-_REPORT_TOOL_NAMES = {"report_generation", "report_edit"}
+# Tool names that actually create a report. Used to tell whether the agent really
+# ran a generation (vs. just claiming one) so a fabricated "done" never stands.
+_REPORT_TOOL_NAMES = {"report_generation"}
 
 StreamEventType = Literal[
     "delta", "reset", "tool_start", "tool_end", "tool_query", "tools_used",
@@ -66,8 +81,11 @@ def _load_skill_files() -> dict[str, dict[str, str]]:
 def _skill_files() -> dict[str, dict[str, str]]:
     return _load_skill_files()
 
+
 # Greetings / small talk — routed around the tool-calling agent (models often
-# ignore "don't call tools" in the system prompt when tools are available).
+# ignore "don't call tools" in the system prompt when tools are available). This
+# is NOT report-intent detection (the LLM router handles that); it only separates
+# pure small talk from substantive questions inside the "chat" intent.
 _CONVERSATIONAL_RE = re.compile(
     r"^(?:"
     r"(?:hi|hey|hello|hiya|howdy|yo|sup|wassup|what(?:'s| is) up|"
@@ -83,125 +101,10 @@ _PRODUCT_KEYWORDS_RE = re.compile(
     r"bom|pcb|component|cost|price|upload|image|photo|datasheet|schematic|"
     r"reverse.?engineer|should.?cost|enclosure|mcu|connector|pinout|layer|"
     r"analy(?:s[ei]|ze)|product|project|file|document|manual|spec|board|part|"
-    r"ic|chip|assembly|fabricat|sourc|estimate|know about|uploaded|analyzed|"
-    r"report|re.?generate|pdf|generate|markdown|title"
+    r"ic|chip|assembly|fabricat|sourc|estimate|know about|uploaded|analyzed"
     r")\b",
     re.IGNORECASE,
 )
-# Imperative / confirmation follow-ups ("just do it", "go ahead", "regenerate",
-# "yes do it"). These are ACTIONS, not small talk — they must reach the tool
-# agent (which has the conversation history and can act on the prior request).
-# Without this, short commands fall through to the no-tools greeting path, where
-# the model fabricates a "done" reply without ever calling a tool.
-_COMMAND_RE = re.compile(
-    r"\b(?:"
-    r"do it|just do it|do that|go ahead|go for it|make it|proceed|continue|"
-    r"re-?generate|re-?gen|re-?do|generate|create|build|render|update|change|"
-    r"rename|re-?title|edit|modify|revise|adjust|set|rewrite|"
-    r"add|remove|delete|attach|include|insert|fix|apply"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# --------------------------------------------------------------------------- #
-# Report-intent detection (deterministic).
-#
-# The model intermittently REPLIES that it generated/edited a report without ever
-# calling a tool — nothing actually changes, but the user is told it did. We can't
-# rely on the prompt to stop this. Instead we (1) detect a clear report request in
-# code, (2) force the tool with a directive, and (3) back it up with a guard that
-# refuses to let a "done" claim through when no report tool ran.
-# --------------------------------------------------------------------------- #
-
-# Imperative verbs that, with a report/field cue, mean "edit the existing report".
-_EDIT_VERB_RE = re.compile(
-    r"\b(?:rename|re-?title|reword|re-?write|re-?price|re-?order|shorten|lengthen|"
-    r"expand|hide|unhide|embed|change|set|update|edit|modify|revise|adjust|remove|"
-    r"delete|drop|add|attach|insert|replace|use|put|increase|decrease|lower|raise|"
-    r"swap|correct|fix|round|make)\b",
-    re.IGNORECASE,
-)
-# A report/field the edit could target — guards the broad verbs above so a generic
-# imperative ("update me", "set a reminder") doesn't get mistaken for a report edit.
-_EDIT_CUE_RE = re.compile(
-    r"\b(?:report|title|sub-?title|section|heading|pdf|summary|executive|overview|"
-    r"architecture|methodology|bom|bill of materials|line|lines|price|priced|"
-    r"pricing|cost|costing|qty|quantity|volume|unit|units|component|components|"
-    r"part|parts|assembly|fab|fabrication|enclosure|firmware|image|images|photo|"
-    r"picture|mcu|ic|resistor|capacitor|connector|led|rate|column|row|landed|duty|"
-    r"margin|market)\b",
-    re.IGNORECASE,
-)
-# Verbs that, with a "report" noun, mean "build a NEW report from scratch".
-_GENERATE_REPORT_RE = re.compile(
-    r"\b(?:generate|re-?generate|create|re-?create|build|re-?build|produce|prepare|"
-    r"draft|make|give me|need|want|do)\b[^?]*?\b(?:should.?cost\s+report|"
-    r"cost\s+report|bom\s+report|cost\s+breakdown|cost\s+pdf|report)\b",
-    re.IGNORECASE,
-)
-# A reply that CLAIMS a report was produced/changed — what the model says when it
-# fabricates success. Matched only to catch fabrication when no tool ran.
-_CLAIMS_REPORT_RE = re.compile(
-    r"(?:"
-    r"\b(?:generated|created|built|made|produced|updated|edited|revised|changed|"
-    r"renamed|re-?titled|modified|adjusted|removed|added|attached|set|applied|done)\b"
-    r"[^.\n]{0,60}\b(?:report|pdf|title|section|bom|version|change|chang)"
-    r"|\b(?:report|pdf)\b[^.\n]{0,40}\b(?:is|has been|now)\b[^.\n]{0,20}"
-    r"\b(?:ready|updated|generated|created|done|available|titled|renamed)"
-    r"|\bnow\s+titled\b"
-    r"|^\s*(?:done|all done|sure thing)[!.\s]"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def _is_report_edit_command(text: str) -> bool:
-    """True for a clear imperative request to EDIT the existing report."""
-    t = (text or "").strip()
-    if not t or t.endswith("?"):
-        return False
-    if _GENERATE_REPORT_RE.search(t):
-        return False  # a NEW-report request, not an edit
-    # An unambiguous title rename is enough on its own.
-    from src.services.report_edit import _detect_title_rename
-
-    if _detect_title_rename(t):
-        return True
-    return bool(_EDIT_VERB_RE.search(t) and _EDIT_CUE_RE.search(t))
-
-
-def _is_report_generate_command(text: str) -> bool:
-    """True for a clear request to GENERATE a new report."""
-    t = (text or "").strip()
-    if not t or t.endswith("?"):
-        return False
-    return bool(_GENERATE_REPORT_RE.search(t))
-
-
-def _claims_report_action(reply: str) -> bool:
-    """True when the reply asserts a report was generated/edited (success claim)."""
-    return bool(_CLAIMS_REPORT_RE.search(reply or ""))
-
-
-def _force_tool_directive(*, edit: bool, generate: bool) -> str:
-    """A directive appended to the user turn so the model must run the tool."""
-    if generate and not edit:
-        which = "the `report_generation` tool"
-        what = "generate the report"
-    elif edit and not generate:
-        which = "the `report_edit` tool"
-        what = "edit the existing report"
-    else:
-        which = "the `report_generation` or `report_edit` tool"
-        what = "create or change the report"
-    return (
-        f"\n\n[SYSTEM DIRECTIVE: This message requires you to {what}. You MUST call "
-        f"{which} to carry it out, and you must do so BEFORE writing any reply. Do "
-        "NOT say the report was generated, updated, renamed, changed, or is "
-        "ready/available unless that tool has actually run and returned a result "
-        "this turn. Replying with a success message without calling the tool is a "
-        "failure.]"
-    )
 
 
 def _system_prompt() -> str:
@@ -238,73 +141,49 @@ def _system_prompt() -> str:
         "interrogate the user over small things.\n\n"
         "Tools — when to use them. Do NOT call any tool for greetings, small talk, "
         "or messages that do not ask about the product, its cost, or uploaded "
-        "evidence (e.g. \"hi\", \"hey\", \"thanks\", \"what can you do?\"). "
-        "Reply directly in those cases. Only call tools when the user asks a "
-        "concrete question that needs stored evidence or live lookup.\n\n"
+        "evidence. Reply directly in those cases. Only call tools when the user "
+        "asks a concrete question that needs stored evidence or live lookup.\n\n"
         "Uploaded images and documents are processed in the background into "
         "per-upload insights, semantic-search chunks, and one cumulative "
         "whole-product knowledge base per project. Use the tools to ground "
         "product answers in that stored evidence:\n"
         "- get_project_context(project_id): the recomputed whole-product picture. "
         "Use when the question spans the whole project (full BOM, architecture, "
-        "overall should-cost, or \"what do we know about this product so far\"). "
-        "Do not call it just because a conversation started.\n"
+        "overall should-cost, or \"what do we know about this product so far\").\n"
         "- list_project_uploads(project_id): list every uploaded file/image with "
-        "its processing status. Use it to see what exists, or to resolve a file "
-        "the user names/numbers into a file_id.\n"
-        "- get_upload_insight(project_id, file_id): the full theory + structured "
-        "analysis of ONE specific upload. Use after resolving a name via "
-        "list_project_uploads.\n"
+        "its processing status, or to resolve a file the user names into a file_id.\n"
+        "- get_upload_insight(project_id, file_id): the full analysis of ONE "
+        "specific upload. Use after resolving a name via list_project_uploads.\n"
         "- get_insights_by_file_ids(project_id, file_ids): full analysis for files "
         "the user explicitly ATTACHED to this message. When file IDs are attached, "
-        "this is the GROUND TRUTH — call it and prioritize it over search results. "
-        "If a file's analysis is still pending, tell the user so.\n"
+        "this is the GROUND TRUTH — call it and prioritize it over search results.\n"
         "- search_image_chunks(project_id, query): semantic search across all "
-        "image analyses for fuzzy visual questions when you don't know which image "
-        "holds the answer (e.g. 'is there a crystal near the MCU').\n"
-        "- search_file_chunks(project_id, query): semantic search across all "
-        "document text for fuzzy spec/manual questions (e.g. 'rated supply "
-        "voltage', 'any certifications mentioned').\n"
+        "image analyses for fuzzy visual questions (e.g. 'is there a crystal near "
+        "the MCU').\n"
+        "- search_file_chunks(project_id, query): semantic search across document "
+        "text for fuzzy spec/manual questions (e.g. 'rated supply voltage').\n"
         "- tavily_search: live web search for external data — current component "
-        "prices, datasheets, MPN lookups, market info. Cite sources and prefer the "
-        "most recent figures.\n"
-        "- report_generation: the should-cost PDF report tool. You MUST call this "
-        "tool — never write a report yourself — whenever the user asks to GENERATE "
-        "a NEW report, should-cost report, BOM cost report, cost breakdown, or cost "
-        "PDF. Pass the user's message as `request`. The tool reads the project KB, "
-        "asks a few clarifying questions if needed, prices the BOM, renders the "
-        "PDF, and streams it to the screen. Use report_generation ONLY to create a "
-        "report from scratch — to CHANGE an existing one, use report_edit (below).\n"
-        "- report_edit: edits the report ALREADY generated in this conversation, in "
-        "place — without rebuilding it. Call this (NOT report_generation) for ANY "
-        "request to change the current report, e.g. \"change the title to X\", "
-        "\"rename the report\", \"remove the LED line\", \"add more detail to the "
-        "assembly section\", \"shorten the executive summary\", \"remove the "
-        "architecture section\", \"reorder the sections\", \"use 5000 units\", "
-        "\"set the MCU price to ₹120\", \"re-price U1\". Put the user's change "
-        "request verbatim in `edit_request`. It is much faster than regenerating "
-        "(no KB re-read, no new questions, no full re-pricing) and is the right "
-        "tool whenever a report already exists. If the user says \"regenerate it\" "
-        "but only wants a tweak, prefer report_edit; only fall back to "
-        "report_generation if they explicitly want it rebuilt from scratch or no "
-        "report exists yet. Do not say you've updated the report unless you "
-        "actually called a tool.\n"
-        "  If the user ATTACHED an image and asks to add/embed/attach it to the "
-        "report (e.g. \"attach this photo to the PDF\"), call report_edit with that "
-        "intent in `edit_request` AND pass the attached file IDs in the `file_ids` "
-        "argument so the tool embeds the image and re-renders the PDF. If the "
-        "tool's result says the image could not be embedded, relay that honestly — "
-        "do NOT claim the image was added.\n\n"
+        "prices, datasheets, MPN lookups, market info. Cite sources.\n"
+        "- report_generation: the should-cost PDF report tool. Call this — never "
+        "write a report yourself — when the user asks to GENERATE a NEW report, "
+        "should-cost report, BOM cost report, cost breakdown, or cost PDF. Pass the "
+        "user's message as `request`. It reads the project KB, asks a few "
+        "clarifying questions if needed, prices the BOM, renders the PDF, and "
+        "streams it. If the user ATTACHED images they want in the report, pass the "
+        "attached file IDs in `file_ids`. Use it ONLY to create a report from "
+        "scratch — requests to CHANGE an existing report are handled automatically "
+        "by the application before they reach you, so you never edit reports "
+        "yourself.\n"
+        "- get_report: re-display an existing report unchanged. Call this when the "
+        "user wants to SEE/open/pull up a report that already exists (\"show me the "
+        "report\", \"open my cost report\"). It does not recompute anything.\n\n"
         "Combine stored evidence with web search when the user wants both hardware "
-        "details and current external info (e.g. a part's datasheet or price). If "
-        "you still don't know something after using the tools, say so instead of "
-        "guessing.\n\n"
+        "details and current external info. If you still don't know something after "
+        "using the tools, say so instead of guessing.\n\n"
         "Never reveal internal identifiers. The project ID, file IDs, and insight "
-        "IDs (UUIDs like 'd3d6b64d-3705-...') are internal plumbing — pass them to "
-        "tools, but NEVER print them in your reply to the user. Always refer to a "
-        "project, file, or image by its human-readable name (e.g. \"the PCB top "
-        "photo\" or \"datasheet.pdf\"). If a file has no name, describe it (\"the "
-        "first uploaded image\") — do not fall back to its ID."
+        "IDs (UUIDs) are internal plumbing — pass them to tools, but NEVER print "
+        "them in your reply. Always refer to a project, file, or image by its "
+        "human-readable name (e.g. \"the PCB top photo\" or \"datasheet.pdf\")."
     )
 
 
@@ -360,24 +239,42 @@ def _project_hint(project_id: str) -> str:
     )
 
 
-def _is_conversational_message(text: str) -> bool:
-    """True when the user message is greeting/small-talk with no product question."""
-    cleaned = text.strip()
+def _tool_nudge(intent: str) -> str:
+    """A short instruction so the agent reliably runs the tool the router chose.
+
+    The router has already decided intent; this just keeps the model from
+    answering in prose instead of calling the tool. It is NOT the old
+    anti-fabrication ``[SYSTEM DIRECTIVE]`` (removed) — edits no longer flow
+    through the agent, and generation honesty is backed by the check below.
+    """
+    if intent == "generate":
+        return (
+            "\n\n[The user is asking for a NEW should-cost report. Call the "
+            "report_generation tool (pass their message as `request`) to build it "
+            "before replying. Do not describe a report you have not generated.]"
+        )
+    if intent == "fetch":
+        return (
+            "\n\n[The user wants to view the existing report. Call the get_report "
+            "tool to re-display it before replying.]"
+        )
+    return ""
+
+
+def _is_greeting(text: str) -> bool:
+    """True for an explicit greeting / thanks / ack with no product content.
+
+    Deliberately conservative: it must MATCH the greeting regex, so short
+    imperatives like "bold it" or "center the title" are NOT swallowed here and
+    still reach the intent router. This is a fast-path to skip the router LLM for
+    obvious small talk — not report-intent detection.
+    """
+    cleaned = (text or "").strip()
     if not cleaned:
         return True
     if _PRODUCT_KEYWORDS_RE.search(cleaned):
         return False
-    # Imperative/confirmation commands ("just do it", "go ahead") are actions, not
-    # small talk — route them to the tool agent even though they're short. Checked
-    # BEFORE the greeting regex so "ok do it" still reaches the tools.
-    if _COMMAND_RE.search(cleaned):
-        return False
-    if _CONVERSATIONAL_RE.match(cleaned):
-        return True
-    # Very short non-questions with no product keywords (e.g. "hey there").
-    if len(cleaned) <= 20 and not cleaned.endswith("?"):
-        return len(cleaned.split()) <= 4
-    return False
+    return bool(_CONVERSATIONAL_RE.match(cleaned))
 
 
 def _latest_user_turn(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -385,15 +282,6 @@ def _latest_user_turn(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
         if message.get("role") == "user":
             return message
     return None
-
-
-def _needs_tools(messages: list[dict[str, Any]]) -> bool:
-    latest = _latest_user_turn(messages)
-    if latest is None:
-        return False
-    if latest.get("file_ids"):
-        return True
-    return not _is_conversational_message(str(latest.get("content", "")))
 
 
 def _to_lc_messages(
@@ -479,8 +367,7 @@ def _greeting_prompt() -> str:
         "reports or PDFs. NEVER claim you generated, updated, renamed, or "
         "regenerated a report or that a file is ready — you did not. If the user "
         "seems to be asking for a report or a change to one, briefly invite them "
-        "to restate the request (e.g. \"sure — tell me what to call it and I'll "
-        "regenerate it\") instead of pretending it's done."
+        "to restate the request instead of pretending it's done."
     )
 
 
@@ -499,22 +386,51 @@ async def _direct_chat_stream(
             yield {"type": "delta", "text": delta}
 
 
-async def _run_direct_edit(
+# --------------------------------------------------------------------------- #
+# Edit flow — deterministic free-form HTML editing (no deep agent).
+# --------------------------------------------------------------------------- #
+async def _edit_flow(
     request: str,
     project_id: str | None,
     user_id: str | None,
     conversation_id: str | None,
     file_ids: list[str] | None,
+    preloaded_report: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Run ``report_edit`` directly (no LLM) and stream its UI events.
+    """Edit the existing report's HTML, verify the change, persist, and stream.
 
-    Used as the backstop when the agent claimed an edit but never called the tool.
-    The synchronous edit runs in a worker thread; its progress/ready events are
-    bridged back to this async generator through a thread-safe queue. The tool's
-    own (truthful) return text is streamed as the assistant reply — so the user
-    sees exactly what changed, or an honest "couldn't apply that".
+    The HTML edit + verification + render/store run on a worker thread; their
+    progress / ready events bridge back through a thread-safe queue (same pattern
+    the report tool uses for ``report_progress``/``report_ready``). The assistant
+    reply is built from the VERIFIED diff — an unchanged document yields an honest
+    failure and never emits ``report_ready``.
     """
-    from src.agent.tools.report_tool import _emit_for_writer, _generate_modification
+    from src.agent.tools.report_tool import (
+        load_latest_report,
+        render_edited_pdf,
+        save_edited_html,
+    )
+
+    if not project_id:
+        yield {"type": "delta", "text": "No project is associated with this conversation, so I can't edit a report."}
+        return
+
+    base = preloaded_report
+    if base is None:
+        base = await asyncio.to_thread(
+            load_latest_report, conversation_id, project_id, user_id
+        )
+    if not base or not base.get("html"):
+        yield {
+            "type": "delta",
+            "text": (
+                "I don't see a report to edit yet. Want me to generate one first? "
+                "Just ask me to create a should-cost report."
+            ),
+        }
+        return
+
+    html = base["html"]
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -527,22 +443,67 @@ async def _run_direct_edit(
         except RuntimeError:  # loop closed — nothing to deliver to
             pass
 
-    emit = _emit_for_writer(writer)
+    # Editing has its OWN short stage list (and progress bar) — it is NOT the
+    # multi-step generation pipeline, so it must not show that stepper. Stages:
+    # editing -> storing (the PDF re-renders in the background, off the hot path).
+    # The frontend renders an edit-specific indicator keyed on ``mode == "edit"``.
+    _edit_progress = {"editing": 0.55, "storing": 0.92, "report_ready": 1.0}
+
+    def emit(stage: str, status: str, message: str, meta: dict[str, Any] | None = None) -> None:
+        prog = _edit_progress.get(stage, 0.5)
+        if status == "started":
+            prog = max(0.05, prog - 0.15)
+        writer({
+            "kind": "report_progress",
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "progress": round(prog, 3),
+            "meta": meta or {},
+        })
 
     def run() -> None:
         try:
-            result["text"] = _generate_modification(
-                str(project_id), conversation_id, user_id, request, request,
-                file_ids=file_ids, emit=emit, writer=writer,
+            image_urls: list[str] = []
+            if file_ids:
+                from src.services.file_storage import get_image_refs_by_ids
+
+                refs = get_image_refs_by_ids([str(f) for f in file_ids])
+                image_urls = [r["url"] for r in refs if r.get("url")]
+
+            emit("editing", "started", "Applying your changes to the report…")
+            res = html_editor.edit(html, request, image_urls)
+            result["edit"] = res
+            if not res.applied:
+                emit("editing", "done", "No changes were applied.")
+                return
+
+            payload = save_edited_html(
+                base=base,
+                html=res.html,
+                markdown_text=res.markdown,
+                project_id=str(project_id),
+                conversation_id=conversation_id,
+                user_id=user_id,
+                emit=emit,
             )
+            writer({"kind": "report_ready", **payload})
+            # Re-render the PDF in the background so the edit stream finishes
+            # immediately; downloads re-render from the saved HTML until it lands.
+            threading.Thread(
+                target=render_edited_pdf,
+                args=(payload["report_id"], res.html),
+                name="edit-pdf-render",
+                daemon=True,
+            ).start()
         except Exception as exc:  # pragma: no cover - defensive
             result["error"] = exc
-            logger.warning("Direct report edit failed", exc_info=True)
+            logger.warning("Free-form HTML edit failed", exc_info=True)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, done)
 
     yield {"type": "tool_start", "tool": "report_edit", "label": tool_label("report_edit")}
-    threading.Thread(target=run, name="direct-report-edit", daemon=True).start()
+    threading.Thread(target=run, name="html-report-edit", daemon=True).start()
 
     while True:
         payload = await queue.get()
@@ -559,18 +520,12 @@ async def _run_direct_edit(
                 "message": payload.get("message", ""),
                 "progress": payload.get("progress"),
                 "meta": payload.get("meta", {}),
+                # Marks this as an EDIT so the UI shows the edit indicator, not the
+                # full generation stepper.
+                "mode": "edit",
             }
         elif kind == "report_ready":
-            yield {
-                "type": "report_ready",
-                "report_id": payload.get("report_id"),
-                "title": payload.get("title"),
-                "html": payload.get("html"),
-                "pdf_url": payload.get("pdf_url"),
-                "markdown": payload.get("markdown"),
-                "volume": payload.get("volume"),
-                "fx_rate": payload.get("fx_rate"),
-            }
+            yield {"type": "report_ready", **{k: v for k, v in payload.items() if k != "kind"}}
 
     yield {"type": "tool_end", "tool": "report_edit", "label": tool_label("report_edit")}
 
@@ -584,7 +539,12 @@ async def _run_direct_edit(
         }
         return
 
-    text = (result.get("text") or "").strip()
+    res = result.get("edit")
+    if res is None:
+        yield {"type": "delta", "text": "Sorry — I couldn't edit the report just now. Please try again."}
+        return
+
+    text = (res.summary if res.applied else res.failure_message).strip()
     if text:
         yield {"type": "delta", "text": text}
     yield {
@@ -804,18 +764,6 @@ async def chat_stream(
       - ``questions``: ``{"type": "questions", "thread_id", "questions": [...]}``
         — HILT pause; resume with :func:`resume_stream` once answered.
     """
-    use_tools = _needs_tools(messages)
-    lc_messages = _to_lc_messages(
-        messages,
-        project_id,
-        inject_project_hint=use_tools,
-    )
-
-    if not use_tools:
-        async for event in _direct_chat_stream(lc_messages):
-            yield event
-        return
-
     latest = _latest_user_turn(messages)
     latest_text = str(latest.get("content", "")) if latest else ""
     latest_file_ids = (
@@ -824,15 +772,42 @@ async def chat_stream(
         else []
     )
 
-    # Deterministic report-intent detection. When the user clearly asks to build or
-    # change a report we (1) force the model to call the tool and (2) refuse to let
-    # a fabricated "done" through if it doesn't (see the backstop below).
-    edit_intent = _is_report_edit_command(latest_text)
-    generate_intent = _is_report_generate_command(latest_text)
-    report_intent = edit_intent or generate_intent
-    if report_intent and lc_messages and isinstance(lc_messages[-1], HumanMessage):
-        directive = _force_tool_directive(edit=edit_intent, generate=generate_intent)
-        lc_messages[-1] = HumanMessage(content=lc_messages[-1].content + directive)
+    # ---- Greeting fast-path → plain reply, no router LLM, no tools --------- #
+    # Skips the intent-router round-trip entirely for obvious small talk, so a
+    # "hi"/"thanks" is instant instead of waiting on a classification call.
+    if not latest_file_ids and _is_greeting(latest_text):
+        lc_messages = _to_lc_messages(messages, project_id, inject_project_hint=False)
+        async for event in _direct_chat_stream(lc_messages):
+            yield event
+        return
+
+    # ---- Intent routing ---------------------------------------------------- #
+    # Only pay for the LLM intent classification when a report actually exists —
+    # edits/fetch are impossible otherwise, so there is nothing to route and we
+    # send the turn straight to the deep agent (which self-routes generation and
+    # product Q&A). This avoids an extra LLM round-trip on every pre-report turn.
+    has_report = (
+        await asyncio.to_thread(
+            reports.report_exists, conversation_id, project_id, user_id
+        )
+        if project_id
+        else False
+    )
+    intent = await intent_router.classify(messages) if has_report else None
+
+    # ---- EDIT → deterministic free-form HTML edit engine ------------------- #
+    if intent == "edit":
+        async for event in _edit_flow(
+            latest_text, project_id, user_id, conversation_id, latest_file_ids
+        ):
+            yield event
+        return
+
+    # ---- GENERATE / FETCH / question / chat → the deep agent --------------- #
+    # (Also the path when no report exists yet, or the router failed.)
+    lc_messages = _to_lc_messages(messages, project_id, inject_project_hint=True)
+    if intent in ("generate", "fetch") and lc_messages and isinstance(lc_messages[-1], HumanMessage):
+        lc_messages[-1] = HumanMessage(content=lc_messages[-1].content + _tool_nudge(intent))
 
     thread_id = str(uuid.uuid4())
     config = _agent_config(
@@ -857,39 +832,27 @@ async def chat_stream(
             if any(t.get("tool") in _REPORT_TOOL_NAMES for t in event.get("tools", [])):
                 report_tool_ran = True
         elif etype == "questions":
-            # HILT — a report tool is actively running and will resume later.
+            # HILT — the report tool is actively running and will resume later.
             paused_for_questions = True
             report_tool_ran = True
         yield event
 
-    # ---- Anti-fabrication backstop ----------------------------------------- #
-    # The user asked for a report action but NO report tool ran. If the model
-    # nonetheless claimed success (or said nothing), don't let that stand: clear
-    # the fabricated text and actually do the work (edits) or own up (generation).
-    if report_intent and not report_tool_ran and not paused_for_questions:
-        reply = "".join(reply_parts)
-        if not reply.strip() or _claims_report_action(reply):
-            logger.info(
-                "Anti-fabrication backstop engaged (edit=%s generate=%s): model "
-                "claimed a report action without calling a tool.",
-                edit_intent, generate_intent,
-            )
-            yield {"type": "reset"}
-            if edit_intent and project_id:
-                async for event in _run_direct_edit(
-                    latest_text, project_id, user_id, conversation_id, latest_file_ids
-                ):
-                    yield event
-            else:
-                yield {
-                    "type": "delta",
-                    "text": (
-                        "I didn't actually generate the report — no report was "
-                        "created, despite what I may have said. Tell me to go ahead "
-                        "and I'll run the report generator now (I may ask a couple of "
-                        "quick questions first)."
-                    ),
-                }
+    # ---- Generation honesty check ----------------------------------------- #
+    # The router said GENERATE but no report tool ran and we didn't pause for
+    # questions. Don't let a fabricated "done" stand: clear it and tell the truth.
+    # (Edits can't fabricate — they're built from a verified HTML diff. Fetch is
+    # read-only, so no check is needed there.)
+    if intent == "generate" and not report_tool_ran and not paused_for_questions:
+        logger.info("Generation honesty check engaged: no report tool ran for a generate intent.")
+        yield {"type": "reset"}
+        yield {
+            "type": "delta",
+            "text": (
+                "I didn't actually generate the report yet. Tell me to go ahead and "
+                "I'll run the report generator now (I may ask a couple of quick "
+                "questions first)."
+            ),
+        }
 
 
 async def resume_stream(

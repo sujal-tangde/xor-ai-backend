@@ -10,8 +10,9 @@ URL), streams a ``report_ready`` event so the preview panel shows the report on 
 right with its download button, and returns a short confirmation. Nothing is
 recomputed: the report is served exactly as it was last saved.
 
-To CREATE a report use ``report_generation``; to CHANGE one use ``report_edit``.
-This tool only retrieves and shows an existing report.
+To CREATE a report use ``report_generation``; requests to CHANGE an existing
+report are handled automatically by the application's HTML edit engine (not a
+tool). This tool only retrieves and shows an existing report.
 """
 
 from __future__ import annotations
@@ -125,6 +126,7 @@ def get_report_tool(
             "kind": "report_ready",
             "report_id": record.get("id"),
             "title": title,
+            "html": record.get("html"),
             "markdown": markdown_text,
             "pdf_url": record.get("pdf_url"),
             "volume": record.get("volume"),

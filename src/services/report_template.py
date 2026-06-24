@@ -86,6 +86,18 @@ ul.tight li{margin-bottom:4px;color:var(--sub)}
 .arch .blk .h{background:var(--tablehdr);padding:8px 11px;font-weight:700;color:var(--brand-2);border-right:1px solid var(--line)}
 .arch .blk .b{padding:8px 11px;color:var(--sub)}
 footer{padding:18px 48px 30px;color:var(--muted);font-size:10.5px;line-height:1.5}
+@media screen{
+  html{overflow-x:auto;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#c4cad4 transparent}
+  html::-webkit-scrollbar{width:5px;height:5px}
+  html::-webkit-scrollbar-thumb{background:#c4cad4;border-radius:9999px}
+  html::-webkit-scrollbar-track{background:transparent}
+  body{margin:0;background:#fff;overflow-x:auto}
+  .doc{max-width:100%;width:100%;margin:0;box-shadow:none;overflow-x:hidden}
+  section{overflow-x:auto;max-width:100%;scrollbar-width:thin;scrollbar-color:#c4cad4 transparent}
+  section::-webkit-scrollbar{width:5px;height:5px}
+  section::-webkit-scrollbar-thumb{background:#c4cad4;border-radius:9999px}
+  section::-webkit-scrollbar-track{background:transparent}
+}
 @media print{.doc{box-shadow:none;margin:0}}
 """
 
@@ -104,11 +116,31 @@ def fmt_inr(amount: Any, decimals: int = 2) -> str:
     return f"₹{val:,.{decimals}f}"
 
 
+def _bom_price_label(tag: str | None, note: str | None = None) -> str:
+    """Plain-language BOM line pricing status (shown in the Source column)."""
+    if str(tag or "").lower() == "live":
+        return "Found in parts DB"
+    note_l = (note or "").lower()
+    if "generic passive" in note_l:
+        return "Estimated (generic part)"
+    if "not resolved" in note_l:
+        return "Part not identified — estimated"
+    if "live price break unavailable" in note_l:
+        return "Found but no price — estimated"
+    return "Not found — estimated"
+
+
 def _tag_html(tag: str, source: str | None) -> str:
+    """Generic source tag for fab/assembly/market rows."""
     cls = "live" if str(tag).lower() == "live" else "est"
-    label = "Live" if cls == "live" else "Est"
+    label = "Live quote" if cls == "live" else "Estimated"
     src = f'<span class="src">{esc(source)}</span>' if source else ""
-    return f'<span class="tag {cls}">{label}</span>{src}'
+    return f'<span class="tag {cls}">{esc(label)}</span>{src}'
+
+
+def _bom_price_html(tag: str | None, note: str | None = None) -> str:
+    cls = "live" if str(tag or "").lower() == "live" else "est"
+    return f'<span class="tag {cls}">{esc(_bom_price_label(tag, note))}</span>'
 
 
 def _confidence_tag(level: str | None) -> str:
@@ -300,7 +332,7 @@ def _bom(rj: dict[str, Any]) -> str:
             f"<td class='n'>{fmt_inr(r.get('unit_inr'))}</td>"
             f"<td class='n'>{esc(r.get('bcd_igst'))}</td>"
             f"<td class='n'>{fmt_inr(r.get('ext_inr'))}</td>"
-            f"<td>{_tag_html(r.get('tag'), r.get('source'))}</td>"
+            f"<td>{_bom_price_html(r.get('tag'), r.get('note'))}</td>"
             "</tr>"
         )
     if not rows_html:
@@ -311,13 +343,14 @@ def _bom(rj: dict[str, Any]) -> str:
     <div class="sec-no">05</div>
     <div class="sec-h">{esc(_sec_title(rj, "bom", "Bill of Materials"))}</div>
     <p class="lead">Reconstructed BOM with per-line landed cost. Unit pricing reflects the qty break at the
-    selected volume, duty-loaded per HSN classification. Every line is tagged Live (distributor) or Est (estimate).</p>
+    selected volume, duty-loaded per HSN classification. Each line shows whether the price was
+    <strong>found in the parts database</strong> or <strong>estimated</strong> because the MPN was not found.</p>
     <table>
       <thead>
         <tr>
           <th>S.No</th><th>MPN</th><th>Make</th><th>Description</th><th>Desig.</th>
           <th class="n">Qty</th><th>Pkg</th><th class="n">Unit ₹</th><th class="n">BCD/IGST</th>
-          <th class="n">Ext. ₹</th><th>Source</th>
+          <th class="n">Ext. ₹</th><th>Price status</th>
         </tr>
       </thead>
       <tbody>{rows_html}</tbody>
@@ -326,8 +359,8 @@ def _bom(rj: dict[str, Any]) -> str:
         <td class="n">{fmt_inr(subtotal)}</td><td></td></tr>
       </tfoot>
     </table>
-    <p class="note">Duty is modeled per-MPN from the inferred HSN code. Lines tagged Est are priced from an
-    industry rate card rather than a live distributor quote.</p>
+    <p class="note">Duty is modeled per-MPN from the inferred HSN code. Lines marked
+    &ldquo;Not found — estimated&rdquo; use a predicted price by component type, not a real catalog quote.</p>
   </section>"""
 
 
@@ -475,9 +508,12 @@ def _mc(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ").strip() or "—"
 
 
-def _tag_text(tag: str | None, source: str | None) -> str:
-    label = "Live" if str(tag).lower() == "live" else "Est"
-    return f"{label} · {source}" if source else label
+def _tag_text(tag: str | None, source: str | None, *, note: str | None = None) -> str:
+    if str(source or "").lower() in {"jlcpcb", "rate-card"} or note is not None:
+        return _bom_price_label(tag, note)
+    if str(tag or "").lower() == "live":
+        return "Live quote"
+    return "Estimated"
 
 
 def _md_table(header: list[str], aligns: list[str], rows: list[list[str]]) -> str:
@@ -591,18 +627,18 @@ def render_markdown(report_json: dict[str, Any]) -> str:
                 _mc(r.get("sno")), _mc(r.get("mpn")), _mc(r.get("make")), _mc(r.get("description")),
                 _mc(r.get("designator")), _mc(r.get("qty")), _mc(r.get("pkg")),
                 fmt_inr(r.get("unit_inr")), _mc(r.get("bcd_igst")), fmt_inr(r.get("ext_inr")),
-                _mc(_tag_text(r.get("tag"), r.get("source"))),
+                _mc(_tag_text(r.get("tag"), r.get("source"), note=r.get("note"))),
             ]
             for r in bom.get("rows") or []
         ]
         bom_rows.append(["", "", "", "", "", "", "", "", "**Subtotal**", f"**{fmt_inr(bom.get('subtotal_inr'))}**", ""])
         out.append(f"## 05 · {_sec_title(rj, 'bom', 'Bill of Materials')}")
         out.append(_md_table(
-            ["S.No", "MPN", "Make", "Description", "Desig.", "Qty", "Pkg", "Unit ₹", "BCD/IGST", "Ext ₹", "Source"],
+            ["S.No", "MPN", "Make", "Description", "Desig.", "Qty", "Pkg", "Unit ₹", "BCD/IGST", "Ext ₹", "Price status"],
             ["---:", "---", "---", "---", "---", "---:", "---", "---:", "---", "---:", "---"],
             bom_rows,
         ))
-        out.append("*Duty is modeled per-MPN from the inferred HSN code. Lines tagged Est are rate-card estimates.*")
+        out.append("*Duty is modeled per-MPN from the inferred HSN code. Lines marked \"Not found — estimated\" use a predicted price by component type.*")
 
     # 06 PCB Fab & Assembly
     if "fab_assembly" not in hidden:

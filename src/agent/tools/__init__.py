@@ -6,9 +6,6 @@ from src.agent.tools.project_context_tool import get_project_context_tool
 from src.agent.tools.report_tool import TOOL_LABEL as REPORT_GENERATION_LABEL
 from src.agent.tools.report_tool import TOOL_NAME as REPORT_GENERATION_NAME
 from src.agent.tools.report_tool import report_generation_tool
-from src.agent.tools.report_edit_tool import TOOL_LABEL as REPORT_EDIT_LABEL
-from src.agent.tools.report_edit_tool import TOOL_NAME as REPORT_EDIT_NAME
-from src.agent.tools.report_edit_tool import report_edit_tool
 from src.agent.tools.get_report_tool import TOOL_LABEL as GET_REPORT_LABEL
 from src.agent.tools.get_report_tool import TOOL_NAME as GET_REPORT_NAME
 from src.agent.tools.get_report_tool import get_report_tool
@@ -44,8 +41,11 @@ TOOL_LABELS: dict[str, str] = {
     SEARCH_IMAGE_CHUNKS_NAME: SEARCH_IMAGE_CHUNKS_LABEL,
     SEARCH_FILE_CHUNKS_NAME: SEARCH_FILE_CHUNKS_LABEL,
     REPORT_GENERATION_NAME: REPORT_GENERATION_LABEL,
-    REPORT_EDIT_NAME: REPORT_EDIT_LABEL,
     GET_REPORT_NAME: GET_REPORT_LABEL,
+    # Display label only — report edits run in the deterministic HTML edit engine
+    # (not as a deep-agent tool), but the chat UI still shows a "report editing"
+    # chip for the turn, so the label must resolve.
+    "report_edit": "report editing",
 }
 
 
@@ -59,7 +59,6 @@ def get_agent_tools() -> list:
         search_image_chunks,
         search_file_chunks,
         report_generation_tool,
-        report_edit_tool,
         get_report_tool,
     ]
     tavily = get_tavily_search_tool()

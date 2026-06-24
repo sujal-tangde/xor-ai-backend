@@ -1,25 +1,62 @@
 ---
 name: report-edit-honesty-contract
-description: report tools must never claim success without running; covers tool-skip fabrication, classifier vocab, and honest reporting
+description: report edits are free-form HTML verified by a computed diff; honesty is structural (no diff = no success), not prompt-dependent
 metadata:
   type: project
 ---
 
-## Anti-fabrication harness (the root cause behind "it says done but nothing changed")
+## How report editing works now (free-form HTML + diff verification)
 
-The deep agent intermittently REPLIES that it generated/edited the report **without calling any tool** — for both generation and edits. The prompt alone can't stop this. `src/agent/chat_agent.py` now enforces it deterministically:
-- `_is_report_edit_command` / `_is_report_generate_command` detect report intent (verb + report/field cue; generate = verb + "report"). Both exclude trailing-"?" info questions.
-- On report intent, `_force_tool_directive` is appended to the last user turn so the model must call the tool first.
-- **Backstop:** `chat_stream` tracks whether a `report_generation`/`report_edit` tool actually ran (via the `tools_used` event / HILT `questions`). If the user asked for a report action, no report tool ran, and the reply is empty or `_claims_report_action` matches → it yields `{"type":"reset"}` (UI clears the fabricated bubble) and then does the real thing: edits run directly via `_run_direct_edit` (bridges the sync `_generate_modification` to async through a thread + `loop.call_soon_threadsafe` queue); generation can't run inline (HILT `interrupt()` needs LangGraph) so it emits an honest "I didn't actually generate it" message.
-- `report_tool._generate_modification` accepts injected `emit`/`writer` (split out of `_make_emit` via `_emit_for_writer`) so the direct path streams identical `report_progress`/`report_ready` events.
-- Known gap: requests phrased as a question ("can you rename it to X?") aren't force/backstopped (precision tradeoff) — they rely on the agent calling the tool.
+Should-cost reports are stored as free-form HTML (the `reports.html` column). After
+generation the user can change ANYTHING — title, prose, layout, alignment, section
+structure, images, and cost numbers (numbers are NO LONGER code-protected for
+edits). There is no fixed schema and no closed set of operations. The old
+`classify_edit()` + operation-applier system in `src/services/report_edit.py` and
+the `report_edit` agent tool were DELETED. (`report_edit.py` now contains only
+`_add_images`, still used by the generation pipeline to embed attached images.)
 
-## Edit application bugs (fixed earlier, same file family)
+### Routing — LLM intent router, no regex
+`src/agent/intent_router.py` makes one cheap-model call (`LLM_INTENT_MODEL`,
+falls back to `LLM_MODEL`) classifying the latest message into
+`generate | edit | fetch | chat`. This REPLACES all the old regex report-intent
+detection (`_is_report_edit_command`, `_is_report_generate_command`,
+`_detect_title_rename`, `_force_tool_directive`, `_claims_report_action`, and the
+`[SYSTEM DIRECTIVE]` injection) — so "phrased it differently so it didn't match"
+bugs are gone. `chat_agent.chat_stream` routes:
+- `edit` → `_edit_flow` (deterministic HTML editor; bypasses the deep agent).
+- `generate` / `fetch` → the deep agent (`report_generation` / `get_report`),
+  HILT intact. A light `_tool_nudge` keeps the model calling the right tool.
+- `chat` → plain no-tools reply for small talk (`_is_small_talk`), else the deep
+  agent for substantive product questions.
 
-The should-cost `report_edit` flow (`src/services/report_edit.py` + `src/agent/tools/report_tool.py::_generate_modification`) edits a saved `report_json._compute` then `recompute_numeric` rolls up the numbers. An LLM classifier (`classify_edit`) maps free-text into a fixed operation vocabulary.
+### The HTML edit engine — `src/agent/html_editor.py`
+`edit(html, request, image_urls)` asks the capable model (`LLM_MODEL`) to return
+the COMPLETE modified HTML (delimiter protocol `===CHANGES===/===UNABLE===/===HTML===`,
+which survives full-document output far better than JSON-escaping). Then it
+VERIFIES deterministically (plain Python, no LLM):
+- `compute_diff` / `diff_is_empty` — token/normalized comparison. **Empty diff =>
+  the change didn't happen.** No `report_ready`, honest failure message. This is
+  why fabrication is now structurally impossible: the success summary is built by
+  `build_summary_from_diff` from the ACTUAL diff, never from the model's claims.
+- `existing_images_preserved` — every original `<img src>` must survive unless the
+  request explicitly asked to remove/replace (`removal_requested`). Stops
+  "add an image" from dropping existing images. Retries once, else rejects.
+- `change_scope_ratio` — if an edit changed far more than expected (> 0.6), retry
+  stricter; if still huge, proceed with a warning appended to the summary.
 
-Two failure modes caused a real "I updated it / no it's unchanged" gaslighting loop with a user:
-1. **Missing vocabulary** — there was no op to set a manufacturing-stage's per-unit cost directly (only `set_rate` per-joint/setup/stencil). "Make PCB assembly cost ₹90" was inexpressible, so the edit no-op'd. Fixed by adding `set_stage_cost` (targets: assembly / pcb_fabrication / firmware / enclosure / final_assembly) and exposing current `stage_costs_per_unit_inr` in `_state_summary`.
-2. **Dishonest success** — summary was taken from the classifier's optimistic `summary` field, and `_generate_modification` always returned "Updated the report". Fixed: summary now derives from the actual `changes` list; empty `changes` + no image added → return an explicit "couldn't apply that, report unchanged, do NOT tell the user it was updated" and skip the re-render/`report_ready` stream.
+### Persistence — edited HTML is authoritative
+`report_tool.persist_edited_html` renders the PDF from the edited HTML, uploads it,
+and updates `html` + `markdown` (+ title re-read from the cover `<h1>`/`<title>`).
+It deliberately does NOT write `report_json` — after a free-form edit that JSON is
+a stale generation artifact and must never clobber the edited HTML. The preview
+panel (`ReportPanel.jsx`) renders the HTML in a sandboxed `<iframe>` so
+layout/style edits are actually visible; markdown (via `markdownify`) is a
+fallback. `report_ready` now carries `html`.
 
-**Why:** the contract is "the LLM narrates, the code computes" — but the tool must never claim a change the code didn't make. **How to apply:** when adding a new editable field, add BOTH a classifier op AND make sure `changes.append(...)` only fires when something really changed; never report success off the classifier's self-description.
+**Why:** for EDITS the principle is no longer "LLM narrates, code computes" — the
+user may change numbers freely. The new contract is: **the assistant can only
+report a change the computed diff confirms.** (Generation still computes numbers
+in code and fills the locked template — only edits are free-form.)
+**How to apply:** never build an edit success message from the model's
+self-description; always derive it from the diff, and never emit `report_ready`
+when the diff is empty or an existing image vanished unrequested.
