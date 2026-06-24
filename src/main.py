@@ -22,6 +22,12 @@ async def on_startup() -> None:
         pass
     await asyncio.to_thread(get_agent)
 
+    # Relay worker-published realtime events (insight counts) to connected
+    # websockets. Kept on app.state so it isn't garbage-collected.
+    from src.services.realtime_bridge import run_subscriber
+
+    app.state.realtime_subscriber = asyncio.create_task(run_subscriber())
+
 # Allow the frontend to connect (tighten allow_origins for production).
 app.add_middleware(
     CORSMiddleware,

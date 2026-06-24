@@ -170,6 +170,12 @@ async def chat_socket(websocket: WebSocket):
     user_id = user["id"]
     await websocket.accept()
 
+    # Register this socket so worker-published realtime events (insight counts)
+    # can be pushed to it; unregistered in the finally below.
+    from src.services.realtime_bridge import register, unregister
+
+    register(user_id, websocket)
+
     # Per-connection cache of conversations already verified as owned by this user.
     verified: dict[str, dict[str, Any]] = {}
     # Turns paused for HILT report questions, keyed by chat_id, awaiting answers.
@@ -407,4 +413,5 @@ async def chat_socket(websocket: WebSocket):
         for task in streaming.values():
             if not task.done():
                 task.cancel()
-        return
+    finally:
+        unregister(user_id, websocket)

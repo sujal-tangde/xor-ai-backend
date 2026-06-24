@@ -103,6 +103,87 @@ def _structured_text(value: dict[str, Any] | None) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) if value else ""
 
 
+def _counts(cur: Any, project_id: str) -> tuple[int, int]:
+    """Return (total insight rows, rows already folded into the KB).
+
+    ``processed`` is derived from the ``processed_at`` marker so it can't drift
+    away from reality the way the old +1 counter did.
+    """
+    cur.execute(
+        "SELECT count(*) AS total, "
+        "count(*) FILTER (WHERE processed_at IS NOT NULL) AS processed "
+        "FROM project_insights WHERE project_id = %s",
+        (project_id,),
+    )
+    row = cur.fetchone()
+    return int(row["total"] or 0), int(row["processed"] or 0)
+
+
+def _resync_counts(conn: Any, project_id: str, user_id: str | None) -> None:
+    """Recompute the KB row's counters from ground truth and push them live.
+
+    Used on the idempotent skip path (insight already processed) so a duplicate
+    job still leaves the displayed total/processed correct without re-merging.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        total, processed = _counts(cur, project_id)
+        cur.execute(
+            "UPDATE project_knowledge_base "
+            "SET insights_total = %s, insights_processed = %s, updated_at = now() "
+            "WHERE project_id = %s",
+            (total, processed, project_id),
+        )
+    from src.services.realtime import publish_insights_progress
+
+    publish_insights_progress(user_id, project_id, processed, total)
+
+
+def reconcile_unprocessed_insights(
+    project_id: str | None = None, older_than_seconds: int = 120
+) -> int:
+    """Re-enqueue KB recompute for every insight still missing a ``processed_at``.
+
+    The safety net for lost work: a recompute that died (worker crash, statement
+    timeout) or one that was never enqueued at all (a Redis hiccup swallowed by
+    ``enqueue_knowledge_base_recompute``). Because processing is now idempotent,
+    re-enqueuing an insight is always safe — an already-folded one is skipped.
+    Only rows older than ``older_than_seconds`` are considered so genuinely
+    in-flight uploads aren't double-enqueued. Returns the number re-enqueued.
+    """
+    if not DIRECT_URL:
+        return 0
+
+    from src.services.queue import enqueue_knowledge_base_recompute
+
+    conn = psycopg2.connect(DIRECT_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            if project_id:
+                cur.execute(
+                    "SELECT project_id, id FROM project_insights "
+                    "WHERE project_id = %s AND processed_at IS NULL "
+                    "AND created_at < now() - make_interval(secs => %s)",
+                    (project_id, older_than_seconds),
+                )
+            else:
+                cur.execute(
+                    "SELECT project_id, id FROM project_insights "
+                    "WHERE processed_at IS NULL "
+                    "AND created_at < now() - make_interval(secs => %s)",
+                    (older_than_seconds,),
+                )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for proj, insight_id in rows:
+        enqueue_knowledge_base_recompute(str(proj), str(insight_id))
+    if rows:
+        logger.info("Reconcile re-enqueued %s unprocessed insight(s)", len(rows))
+    return len(rows)
+
+
 def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
     """Fold the insight ``insight_id`` into the project's knowledge-base row."""
     if not DIRECT_URL:
@@ -113,13 +194,40 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
-            # Serialise per-project across workers for the whole recompute.
-            cur.execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (project_id,))
+            # This is a background job whose critical section spans an LLM merge,
+            # so the per-project advisory lock can be held for many seconds while
+            # other workers' jobs queue behind it. Disable the platform
+            # statement_timeout on this connection so neither the blocking lock
+            # wait nor the merge queries get cancelled mid-flight — that timeout
+            # firing on the lock wait was the cause of "canceling statement due to
+            # statement timeout". A bounded lock_timeout still keeps a worker from
+            # blocking forever if a holder is wedged (advisory locks are also
+            # auto-released when their holding connection closes).
+            cur.execute("SET statement_timeout = 0")
+            cur.execute("SET lock_timeout = '180s'")
+
+        # Serialise per-project across workers for the whole recompute. If the
+        # lock can't be acquired within lock_timeout, hand the job back to the
+        # queue instead of dropping the merge or tying up this worker.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (project_id,))
+        except psycopg2.errors.LockNotAvailable:
+            logger.warning(
+                "KB recompute could not acquire lock for project %s within "
+                "lock_timeout; re-enqueuing insight %s",
+                project_id,
+                insight_id,
+            )
+            from src.services.queue import enqueue_knowledge_base_recompute
+
+            enqueue_knowledge_base_recompute(project_id, insight_id)
+            return
 
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT user_id, theory_context, structured_context "
+                    "SELECT user_id, theory_context, structured_context, processed_at "
                     "FROM project_insights WHERE id = %s",
                     (insight_id,),
                 )
@@ -128,14 +236,22 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
                     logger.warning("Insight %s not found; skipping KB recompute", insight_id)
                     return
 
-                cur.execute(
-                    "SELECT COUNT(*) AS n FROM project_insights WHERE project_id = %s",
-                    (project_id,),
-                )
-                total = int(cur.fetchone()["n"])
+                # Idempotency guard. processed_at is set only after this insight
+                # has been folded into the KB, so a duplicate enqueue or a job
+                # retry that follows a successful run must NOT merge it again —
+                # that would double-count its facts into the theory/structured.
+                # Just resync the derived counters (cheap) and return.
+                if insight.get("processed_at") is not None:
+                    logger.info(
+                        "Insight %s already processed for project %s; resyncing counts only",
+                        insight_id,
+                        project_id,
+                    )
+                    _resync_counts(conn, project_id, insight.get("user_id"))
+                    return
 
                 cur.execute(
-                    "SELECT theory_context, structured_context, insights_processed "
+                    "SELECT theory_context, structured_context "
                     "FROM project_knowledge_base WHERE project_id = %s",
                     (project_id,),
                 )
@@ -147,9 +263,8 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
 
             existing_theory = (kb.get("theory_context") or "").strip() if kb else ""
             existing_structured = _as_dict(kb.get("structured_context")) if kb else None
-            processed = int(kb.get("insights_processed") or 0) if kb else 0
 
-            if not existing_theory and not existing_structured and processed == 0:
+            if kb is None or (not existing_theory and not existing_structured):
                 # First insight for the project: KB becomes it verbatim, no LLM call.
                 merged_theory = new_theory
                 merged_structured = new_structured
@@ -213,9 +328,18 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
                 elif not merged_theory:
                     merged_theory = existing_theory
 
-            processed_now = processed + 1
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Mark this insight folded-in, then derive both counters from the
+                # table itself rather than blindly bumping a stored +1. A lost or
+                # double-fired job can no longer drift the count: processed is
+                # always exactly "how many insight rows carry a processed_at".
+                cur.execute(
+                    "UPDATE project_insights SET processed_at = now() "
+                    "WHERE id = %s AND processed_at IS NULL",
+                    (insight_id,),
+                )
+                total, processed_now = _counts(cur, project_id)
 
-            with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO project_knowledge_base
@@ -247,6 +371,10 @@ def recompute_knowledge_base(project_id: str, insight_id: str) -> None:
                 processed_now,
                 total,
             )
+            # Push the new processed/total counts to the user's UI in real time.
+            from src.services.realtime import publish_insights_progress
+
+            publish_insights_progress(user_id, project_id, processed_now, total)
         finally:
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (project_id,))

@@ -37,6 +37,11 @@ def record_insight(
     insight_id = record.get("id") if record else None
     if insight_id:
         enqueue_knowledge_base_recompute(project_id, str(insight_id))
+        # Push the bumped total to the user's UI immediately — the matching
+        # `processed` bump follows when the recompute job above completes.
+        from src.services.realtime import publish_project_counts
+
+        publish_project_counts(user_id, project_id)
     else:
         logger.warning(
             "Insight insert for file %s returned no id; KB recompute not enqueued",
