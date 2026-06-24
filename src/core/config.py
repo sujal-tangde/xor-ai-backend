@@ -107,15 +107,34 @@ MOUSER_API_BASE = os.getenv(
 ).strip().strip('"').strip("'")
 
 # --------------------------------------------------------------------------- #
-# PCB fabrication quote — PCBWay (USD prices, converted to INR via Frankfurter).
+# PCB fabrication quote — JLCPCB OpenAPI (USD prices, converted to INR via
+# Frankfurter). Requests are signed with HMAC-SHA256 (see services/jlcpcb.py).
+# The credentials below are env-overridable; move them to .env in production.
 # --------------------------------------------------------------------------- #
+JLCPCB_API_BASE = os.getenv(
+    "JLCPCB_API_BASE", "https://open.jlcpcb.com"
+).strip().strip('"').strip("'")
+JLCPCB_CALCULATE_PATH = os.getenv(
+    "JLCPCB_CALCULATE_PATH", "/overseas/openapi/pcb/calculate"
+).strip().strip('"').strip("'")
+JLCPCB_APP_ID = os.getenv("JLCPCB_APP_ID", "541563789036167170").strip().strip('"').strip("'")
+JLCPCB_ACCESS_KEY = os.getenv(
+    "JLCPCB_ACCESS_KEY", "56e210adc361476e97f0f39a6f0be274"
+).strip().strip('"').strip("'")
+JLCPCB_SECRET_KEY = os.getenv(
+    "JLCPCB_SECRET_KEY", "usxT59LkUuuY7BJyGaM5t5oxNxmzyGim"
+).strip().strip('"').strip("'")
+# Destination country for the quote (affects shipping options, not board cost).
+JLCPCB_COUNTRY = os.getenv("JLCPCB_COUNTRY", "IN").strip().strip('"').strip("'")
+
+# Legacy PCBWay settings (no longer used for quoting; kept for reference).
 PCBWAY_API_KEY = os.getenv("PCBWAY_API_KEY", "").strip().strip('"').strip("'")
 PCBWAY_API_BASE = os.getenv(
     "PCBWAY_API_BASE", "https://api-partner.pcbway.com"
 ).strip().strip('"').strip("'")
 
 # --------------------------------------------------------------------------- #
-# FX — Frankfurter (no key). Used ONLY to convert the PCBWay USD quote to INR.
+# FX — Frankfurter (no key). Used ONLY to convert the JLCPCB USD fab quote to INR.
 # --------------------------------------------------------------------------- #
 FRANKFURTER_API_BASE = os.getenv(
     "FRANKFURTER_API_BASE", "https://api.frankfurter.dev/v1"

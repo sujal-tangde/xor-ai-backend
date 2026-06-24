@@ -392,7 +392,7 @@ def _fab_assembly(rj: dict[str, Any]) -> str:
     <div class="sec-h">{esc(_sec_title(rj, "fab_assembly", "PCB Fabrication & Assembly Detail"))}</div>
     <div class="twocol">
       <div>
-        <p style="font-weight:700;color:var(--brand-2);margin-bottom:4px">A · PCB Fabrication — PCBWay</p>
+        <p style="font-weight:700;color:var(--brand-2);margin-bottom:4px">A · PCB Fabrication — JLCPCB</p>
         <table class="kv">{fab_kv}</table>
       </div>
       <div>
@@ -401,7 +401,7 @@ def _fab_assembly(rj: dict[str, Any]) -> str:
       </div>
     </div>
     <p class="note">Placement count is derived from the BOM. The per-joint rate and setup NRE come from a
-    configurable Indian EMS rate card. PCBWay USD quotes are converted to INR at the rate shown on the cover.</p>
+    configurable Indian EMS rate card. JLCPCB USD quotes are converted to INR at the rate shown on the cover.</p>
   </section>"""
 
 
@@ -646,7 +646,7 @@ def render_markdown(report_json: dict[str, Any]) -> str:
         params = fab.get("params") or {}
         asm = rj.get("assembly") or {}
         out.append(f"## 06 · {_sec_title(rj, 'fab_assembly', 'PCB Fabrication & Assembly Detail')}")
-        out.append("**A · PCB Fabrication — PCBWay**")
+        out.append("**A · PCB Fabrication — JLCPCB**")
         out.append(_md_table(["Parameter", "Value"], ["---", "---"], [
             ["Base material", _mc(params.get("Material") or "FR-4")],
             ["Layers", _mc(params.get("layers"))],

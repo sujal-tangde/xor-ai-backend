@@ -1,7 +1,7 @@
 """USD → INR conversion via Frankfurter (no API key).
 
-Used ONLY to convert the PCBWay USD fab quote to INR. Mouser component prices are
-already INR and must NOT pass through here.
+Used ONLY to convert the JLCPCB USD fab quote to INR. Component prices from the
+parts DB are already INR and must NOT pass through here.
 
 The rate is fetched once and cached per request by the caller (the pipeline holds
 the returned value for the whole run). A process-wide ``last known`` rate is kept

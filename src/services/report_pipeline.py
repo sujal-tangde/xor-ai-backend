@@ -26,7 +26,7 @@ from src.core.config import (
     ASSEMBLY_STENCIL_FEE_INR,
     REPORT_VOLUME_CURVE,
 )
-from src.services import duty, fx, parts_pricing, pcbway, report_estimators
+from src.services import duty, fx, jlcpcb, parts_pricing, report_estimators
 from src.services.failure_log import record_failure
 
 logger = logging.getLogger(__name__)
@@ -321,7 +321,7 @@ def _run_pricing(
 
 
 # --------------------------------------------------------------------------- #
-# Stage E — PCB fab quote (PCBWay live USD → INR, else heuristic INR)
+# Stage E — PCB fab quote (JLCPCB live USD → INR, else heuristic INR)
 # --------------------------------------------------------------------------- #
 def _run_fab(pcb: dict[str, Any], volumes: list[int], fx_info: dict[str, Any]) -> dict[str, Any]:
     """Quote the bare board at each volume. Returns INR per board + provenance.
@@ -333,19 +333,19 @@ def _run_fab(pcb: dict[str, Any], volumes: list[int], fx_info: dict[str, Any]) -
     live = False
     rate = float(fx_info["rate"])
     for v in volumes:
-        q = pcbway.quote_board(pcb, v)
+        q = jlcpcb.quote_board(pcb, v)
         if q is not None:
             fab_by_volume[v] = round(q["usd"] * rate, 2)
             live = True
         else:
-            fab_by_volume[v] = pcbway.heuristic_quote_inr(pcb, v)
+            fab_by_volume[v] = jlcpcb.heuristic_quote_inr(pcb, v)
     return {
         "fab_by_volume": fab_by_volume,
         "live": live,
         "fx": fx_info,
-        "source": "PCBWay" if live else "Internal fab model",
+        "source": "JLCPCB" if live else "Internal fab model",
         "tag": "Live" if live else "Est",
-        "params": pcbway.build_payload(pcb, volumes[-1] if volumes else 1000),
+        "params": jlcpcb.template_params(pcb),
     }
 
 
@@ -447,7 +447,7 @@ def _bom_landed_per_unit(lines: list[dict[str, Any]], volume: int) -> float:
 
 def _fab_at(fab: dict[str, Any], volume: int) -> float:
     """Fab cost at ``volume``; nearest priced volume if it wasn't quoted directly
-    (so an edit to a new target volume needs no fresh PCBWay call)."""
+    (so an edit to a new target volume needs no fresh JLCPCB call)."""
     by_vol = fab.get("fab_by_volume") or {}
     if volume in by_vol:
         return by_vol[volume]
@@ -653,7 +653,7 @@ def run_pipeline(
     fx_rate = float(fx_info["rate"])
 
     emit("pricing", "started", "Pricing components from the parts database…")
-    emit("fab_quote", "started", "Getting PCB fab quote from PCBWay…")
+    emit("fab_quote", "started", "Getting PCB fab quote from JLCPCB…")
     emit("non_quotable", "started", "Estimating firmware, tooling & labour…")
     emit("market_context", "started", "Gathering market & sourcing data from the web…")
 
@@ -688,9 +688,9 @@ def run_pipeline(
                 "Fab quoting stage failed entirely — using the internal fab cost model",
                 error=exc, context={"volumes": price_volumes},
             )
-            fab = {"fab_by_volume": {v: pcbway.heuristic_quote_inr(pcb, v) for v in price_volumes},
+            fab = {"fab_by_volume": {v: jlcpcb.heuristic_quote_inr(pcb, v) for v in price_volumes},
                    "live": False, "fx": fx_info, "source": "Internal fab model",
-                   "tag": "Est", "params": pcbway.build_payload(pcb, 1000)}
+                   "tag": "Est", "params": jlcpcb.template_params(pcb)}
         if not fab["live"]:
             data_quality.append(
                 "The PCB fabrication quote is based on our internal cost model rather "
@@ -829,7 +829,7 @@ def aggregate(
          "confidence": "High" if any(l["tag"] == "Live" for l in lines) else "Low"},
         {"stage": "Landed / customs", "source": "HSN tariff table",
          "method": "Per-MPN HSN → BCD / SWS / IGST", "confidence": "Medium"},
-        {"stage": "PCB fabrication", "source": fab.get("source", "PCBWay"),
+        {"stage": "PCB fabrication", "source": fab.get("source", "JLCPCB"),
          "method": "Live quote → INR" if fab.get("live") else "Area × layers rate-card",
          "confidence": "High" if fab.get("live") else "Medium"},
         {"stage": "PCB assembly", "source": "EMS rate card",
